@@ -4,6 +4,7 @@
 Native-feeling macOS GUI wrapper for NLM Scrubber (Linux CLI version).
 """
 
+import hashlib
 import os
 import re
 import shutil
@@ -14,12 +15,16 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from typing import Callable, Optional
 import zipfile
 from urllib import request
 from urllib.error import URLError, HTTPError
 
 APP_TITLE = "NLM Scrubber (macOS GUI Wrapper)"
 DEFAULT_SCRUBBER_URL = "https://lhncbc.nlm.nih.gov/scrubber/files/scrubber.19.0403L.zip"
+# SHA-256 digest of the expected zip. Set to None to skip verification.
+# Update this whenever DEFAULT_SCRUBBER_URL changes.
+SCRUBBER_SHA256: Optional[str] = None
 SCRUBBER_DIR = os.path.expanduser("~/.nlm_scrubber")
 SCRUBBER_ZIP = os.path.join(SCRUBBER_DIR, "scrubber.zip")
 SCRUBBER_BIN = os.path.join(SCRUBBER_DIR, "scrubber.lnx")
@@ -28,39 +33,53 @@ CONFIG_FILE = os.path.join(SCRUBBER_DIR, "config.txt")
 SUPPORTED_EXTS = {".txt", ".md"}
 
 
-def ensure_dir(path):
+def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def is_supported_file(path):
+def is_supported_file(path: str) -> bool:
     _, ext = os.path.splitext(path.lower())
     return ext in SUPPORTED_EXTS
 
 
-def validate_path(path):
+def validate_path(path: str) -> bool:
     if not path:
         return False
     return os.path.exists(path)
 
 
-def open_in_finder(path):
+def open_in_finder(path: str) -> None:
     try:
         subprocess.run(["open", path], check=False)
     except Exception:
         return
 
 
-def get_latest_scrubber_url(log_cb):
+def verify_checksum(path: str, expected_sha256: str) -> bool:
+    """Return True if the SHA-256 digest of *path* matches *expected_sha256*."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest().lower() == expected_sha256.lower()
+
+
+def get_latest_scrubber_url(log_cb: Callable[[str], None]) -> str:
     try:
         with request.urlopen("https://lhncbc.nlm.nih.gov/scrubber/") as response:
             html = response.read().decode("utf-8", errors="ignore")
-        urls = re.findall(r"https?://[^\"\\s]*scrubber\\.\\d+L\\.zip", html)
+        # Use single backslashes in raw strings: \s = whitespace, \. = literal dot.
+        # The original code had doubled backslashes (\\.) which matched a literal
+        # backslash followed by any character — a bug that prevented URL detection.
+        # Pattern mirrors the real filename format: scrubber.MAJOR.BUILDL.zip
+        urls = re.findall(r'https?://[^"\s]*scrubber\.\d+\.\d+L\.zip', html)
         if not urls:
             return DEFAULT_SCRUBBER_URL
 
-        def version_key(url):
-            match = re.search(r"scrubber\\.(\\d+)L\\.zip", url)
-            return int(match.group(1)) if match else 0
+        def version_key(url: str) -> tuple[int, int]:
+            # URL format: scrubber.MAJOR.BUILDL.zip  e.g. scrubber.19.0403L.zip
+            match = re.search(r'scrubber\.(\d+)\.(\d+)L\.zip', url)
+            return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
 
         latest = max(urls, key=version_key)
         if latest != DEFAULT_SCRUBBER_URL:
@@ -71,7 +90,11 @@ def get_latest_scrubber_url(log_cb):
         return DEFAULT_SCRUBBER_URL
 
 
-def download_scrubber(progress_cb, log_cb, cancel_event):
+def download_scrubber(
+    progress_cb: Callable[[int], None],
+    log_cb: Callable[[str], None],
+    cancel_event: threading.Event,
+) -> bool:
     ensure_dir(SCRUBBER_DIR)
     if os.path.exists(SCRUBBER_BIN):
         return True
@@ -99,7 +122,19 @@ def download_scrubber(progress_cb, log_cb, cancel_event):
         log_cb("Download complete.")
     except (URLError, HTTPError) as err:
         log_cb(f"Download failed: {err}")
+        # Remove the partial download so a retry starts clean.
+        if os.path.exists(SCRUBBER_ZIP):
+            os.remove(SCRUBBER_ZIP)
         raise
+
+    if SCRUBBER_SHA256:
+        log_cb("Verifying checksum...")
+        if not verify_checksum(SCRUBBER_ZIP, SCRUBBER_SHA256):
+            os.remove(SCRUBBER_ZIP)
+            raise ValueError(
+                "Scrubber zip checksum mismatch — the download may be corrupt or tampered with."
+            )
+        log_cb("Checksum verified.")
 
     log_cb("Extracting scrubber...")
     try:
@@ -109,6 +144,8 @@ def download_scrubber(progress_cb, log_cb, cancel_event):
             os.remove(SCRUBBER_ZIP)
     except zipfile.BadZipFile as err:
         log_cb(f"Extraction failed: {err}")
+        if os.path.exists(SCRUBBER_ZIP):
+            os.remove(SCRUBBER_ZIP)
         raise
 
     if not os.path.exists(SCRUBBER_BIN):
@@ -128,30 +165,39 @@ def download_scrubber(progress_cb, log_cb, cancel_event):
     return False
 
 
-def build_config(input_dir, output_dir, use_surrogates):
+_CONFIG_DEFAULTS = [
+    "input_type=txt",
+    "output_type=txt",
+    "find_rated_number=no",
+    "find_date=yes",
+    "find_patient=yes",
+    "find_doctor=yes",
+    "find_hospital=yes",
+    "find_unique_id=yes",
+    "find_url=yes",
+    "find_phone=yes",
+    "find_email=yes",
+    "find_age=yes",
+    "find_state=yes",
+    "find_city=yes",
+]
+
+
+def build_config(input_dir: str, output_dir: str, use_surrogates: bool) -> str:
     ensure_dir(SCRUBBER_DIR)
+    surrogate_line = "use_surrogates=yes" if use_surrogates else "use_surrogates=no"
+    lines = [
+        f"input_dir={input_dir}",
+        f"output_dir={output_dir}",
+        *_CONFIG_DEFAULTS,
+        surrogate_line,
+    ]
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        f.write(f"input_dir={input_dir}\n")
-        f.write(f"output_dir={output_dir}\n")
-        f.write("input_type=txt\n")
-        f.write("output_type=txt\n")
-        f.write("find_rated_number=no\n")
-        f.write("find_date=yes\n")
-        f.write("find_patient=yes\n")
-        f.write("find_doctor=yes\n")
-        f.write("find_hospital=yes\n")
-        f.write("find_unique_id=yes\n")
-        f.write("find_url=yes\n")
-        f.write("find_phone=yes\n")
-        f.write("find_email=yes\n")
-        f.write("find_age=yes\n")
-        f.write("find_state=yes\n")
-        f.write("find_city=yes\n")
-        f.write("use_surrogates=yes\n" if use_surrogates else "use_surrogates=no\n")
+        f.write("\n".join(lines) + "\n")
     return CONFIG_FILE
 
 
-def gather_files(input_path):
+def gather_files(input_path: str) -> list[str]:
     if os.path.isfile(input_path):
         return [input_path] if is_supported_file(input_path) else []
     files = []
@@ -164,7 +210,7 @@ def gather_files(input_path):
 
 
 class ScrubberApp:
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry("760x520")
@@ -176,13 +222,13 @@ class ScrubberApp:
         self.progress_value = tk.IntVar(value=0)
 
         self.cancel_event = threading.Event()
-        self.worker_thread = None
+        self.worker_thread: Optional[threading.Thread] = None
 
         self._configure_style()
         self._build_ui()
         self._setup_dnd()
 
-    def _configure_style(self):
+    def _configure_style(self) -> None:
         style = ttk.Style()
         theme = "aqua" if "aqua" in style.theme_names() else "clam"
         style.theme_use(theme)
@@ -193,7 +239,7 @@ class ScrubberApp:
         style.configure("TLabelframe", padding=8)
         style.configure("TCheckbutton", padding=4)
 
-    def _build_ui(self):
+    def _build_ui(self) -> None:
         main = ttk.Frame(self.root)
         main.pack(fill="both", expand=True)
 
@@ -205,7 +251,10 @@ class ScrubberApp:
         ttk.Label(input_row, text="Input Folder/File:").pack(side="left")
         self.input_entry = ttk.Entry(input_row, textvariable=self.input_path)
         self.input_entry.pack(side="left", fill="x", expand=True, padx=6)
-        ttk.Button(input_row, text="Select Input Folder/File", command=self.select_input).pack(side="left")
+        # Two separate buttons avoid the confusing cascade where cancelling the
+        # file picker would silently open the folder picker.
+        ttk.Button(input_row, text="Select File", command=self.select_input_file).pack(side="left")
+        ttk.Button(input_row, text="Select Folder", command=self.select_input_folder).pack(side="left", padx=(4, 0))
 
         output_row = ttk.Frame(path_frame)
         output_row.pack(fill="x", pady=4)
@@ -222,6 +271,8 @@ class ScrubberApp:
         progress_frame.pack(fill="x", padx=10, pady=8)
         self.progress_bar = ttk.Progressbar(progress_frame, maximum=100, variable=self.progress_value)
         self.progress_bar.pack(fill="x")
+        self.status_label = ttk.Label(progress_frame, text="")
+        self.status_label.pack(anchor="w", pady=(2, 0))
 
         log_frame = ttk.LabelFrame(main, text="Log")
         log_frame.pack(fill="both", expand=True, padx=10, pady=8)
@@ -240,7 +291,7 @@ class ScrubberApp:
         self.cancel_button = ttk.Button(button_frame, text="Cancel", command=self.cancel, state="disabled")
         self.cancel_button.pack(side="left", padx=8)
 
-    def _setup_dnd(self):
+    def _setup_dnd(self) -> None:
         try:
             self.root.tk.call("package", "require", "tkdnd")
         except tk.TclError:
@@ -252,7 +303,7 @@ class ScrubberApp:
         except tk.TclError as err:
             self.log(f"Drag-and-drop setup failed: {err}")
 
-    def _on_drop(self, event):
+    def _on_drop(self, event: tk.Event) -> None:
         data = event.data
         if not data:
             return
@@ -263,10 +314,10 @@ class ScrubberApp:
         if os.path.isdir(selected) or os.path.isfile(selected):
             self.input_path.set(selected)
 
-    def _parse_dnd_paths(self, data):
+    def _parse_dnd_paths(self, data: str) -> list[str]:
         if data.startswith("{") and data.endswith("}"):
             data = data[1:-1]
-        parts = []
+        parts: list[str] = []
         current = ""
         in_brace = False
         for char in data:
@@ -289,20 +340,26 @@ class ScrubberApp:
             parts.append(current)
         return [p for p in parts if p]
 
-    def select_input(self):
-        path = filedialog.askopenfilename(title="Select file", filetypes=[("Text/Markdown", "*.txt *.md"), ("All files", "*.*")])
-        if not path:
-            path = filedialog.askdirectory(title="Select folder")
+    def select_input_file(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select input file",
+            filetypes=[("Text/Markdown", "*.txt *.md"), ("All files", "*.*")],
+        )
         if path:
             self.input_path.set(path)
 
-    def select_output(self):
+    def select_input_folder(self) -> None:
+        path = filedialog.askdirectory(title="Select input folder")
+        if path:
+            self.input_path.set(path)
+
+    def select_output(self) -> None:
         path = filedialog.askdirectory(title="Select output folder")
         if path:
             self.output_path.set(path)
 
-    def log(self, message):
-        def append():
+    def log(self, message: str) -> None:
+        def append() -> None:
             timestamp = time.strftime("%H:%M:%S")
             self.log_text.configure(state="normal")
             self.log_text.insert("end", f"[{timestamp}] {message}\n")
@@ -314,8 +371,8 @@ class ScrubberApp:
         else:
             self.root.after(0, append)
 
-    def set_progress(self, value):
-        def update():
+    def set_progress(self, value: int) -> None:
+        def update() -> None:
             self.progress_value.set(value)
             self.root.update_idletasks()
 
@@ -324,7 +381,16 @@ class ScrubberApp:
         else:
             self.root.after(0, update)
 
-    def start(self):
+    def _set_status(self, text: str) -> None:
+        def update() -> None:
+            self.status_label.configure(text=text)
+
+        if threading.current_thread() is threading.main_thread():
+            update()
+        else:
+            self.root.after(0, update)
+
+    def start(self) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
             return
         input_path = self.input_path.get().strip()
@@ -344,6 +410,7 @@ class ScrubberApp:
 
         self.cancel_event.clear()
         self.progress_value.set(0)
+        self._set_status("Starting...")
         self.start_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
 
@@ -354,13 +421,58 @@ class ScrubberApp:
         )
         self.worker_thread.start()
 
-    def cancel(self):
+    def cancel(self) -> None:
         self.cancel_event.set()
         self.log("Cancellation requested.")
+        self._set_status("Cancelling...")
 
-    def _run_scrubber(self, input_path, output_path, use_surrogates, files):
-        temp_input_dir = None
+    def _prepare_input_dir(self, input_path: str) -> str:
+        """Copy a single file into a temp dir so the scrubber receives a directory.
+
+        Returns the temp dir path; the caller is responsible for cleanup.
+        Raises RuntimeError on failure.
+        """
+        temp_dir = tempfile.mkdtemp(prefix="nlm_scrubber_input_", dir=SCRUBBER_DIR)
         try:
+            shutil.copy2(input_path, temp_dir)
+            self.log(f"Copied file into temporary input folder: {temp_dir}")
+        except OSError as err:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise RuntimeError(f"Failed to prepare input file: {err}") from err
+        return temp_dir
+
+    def _stream_subprocess(self, process: subprocess.Popen) -> int:
+        """Forward stdout of *process* to the log; terminate cleanly on cancel.
+
+        Returns the process exit code, or -1 if cancelled.
+        """
+        while True:
+            if self.cancel_event.is_set():
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                self.log("Process terminated.")
+                return -1
+            line = process.stdout.readline()
+            if line:
+                self.log(line.rstrip())
+            if line == "" and process.poll() is not None:
+                break
+        return process.wait()
+
+    def _run_scrubber(
+        self,
+        input_path: str,
+        output_path: str,
+        use_surrogates: bool,
+        files: list[str],
+    ) -> None:
+        temp_input_dir: Optional[str] = None
+        try:
+            self._set_status("Downloading scrubber...")
             try:
                 if not download_scrubber(self.set_progress, self.log, self.cancel_event):
                     self._finish(False, "Scrubber download was cancelled or failed.")
@@ -374,18 +486,17 @@ class ScrubberApp:
                 return
 
             if os.path.isfile(input_path):
-                temp_input_dir = tempfile.mkdtemp(prefix="nlm_scrubber_input_", dir=SCRUBBER_DIR)
                 try:
-                    shutil.copy2(input_path, temp_input_dir)
-                    self.log(f"Copied file into temporary input folder: {temp_input_dir}")
-                except OSError as err:
-                    self._finish(False, f"Failed to prepare input file: {err}")
+                    temp_input_dir = self._prepare_input_dir(input_path)
+                except RuntimeError as err:
+                    self._finish(False, str(err))
                     return
                 effective_input = temp_input_dir
             else:
                 effective_input = input_path
 
             self.log(f"Preparing to scrub {len(files)} file(s).")
+            self._set_status(f"Scrubbing {len(files)} file(s)...")
             build_config(effective_input, output_path, use_surrogates)
             self.log("Configuration generated.")
             self.set_progress(35)
@@ -401,18 +512,7 @@ class ScrubberApp:
                     text=True,
                     cwd=SCRUBBER_DIR,
                 )
-                while True:
-                    if self.cancel_event.is_set():
-                        process.terminate()
-                        self.log("Process terminated.")
-                        self._finish(False, "Operation cancelled.")
-                        return
-                    line = process.stdout.readline()
-                    if line:
-                        self.log(line.rstrip())
-                    if line == "" and process.poll() is not None:
-                        break
-                code = process.wait()
+                code = self._stream_subprocess(process)
             except FileNotFoundError:
                 self._finish(False, "Scrubber binary not found.")
                 return
@@ -420,20 +520,26 @@ class ScrubberApp:
                 self._finish(False, f"Error running scrubber: {err}")
                 return
 
+            if code == -1:
+                self._finish(False, "Operation cancelled.")
+                return
+
             if code != 0:
                 self._finish(False, f"Scrubber exited with code {code}.")
                 return
 
             self.set_progress(100)
+            self._set_status("Complete")
             self._finish(True, "Anonymization complete.", output_path)
         finally:
             if temp_input_dir:
                 shutil.rmtree(temp_input_dir, ignore_errors=True)
 
-    def _finish(self, success, message, output_path=None):
-        def finish_ui():
+    def _finish(self, success: bool, message: str, output_path: Optional[str] = None) -> None:
+        def finish_ui() -> None:
             self.start_button.configure(state="normal")
             self.cancel_button.configure(state="disabled")
+            self._set_status("")
             if success:
                 self.log(message)
                 if output_path:
@@ -448,7 +554,7 @@ class ScrubberApp:
         self.root.after(0, finish_ui)
 
 
-def main():
+def main() -> None:
     root = tk.Tk()
     app = ScrubberApp(root)
     root.mainloop()
