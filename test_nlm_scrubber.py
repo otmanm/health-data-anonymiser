@@ -42,11 +42,14 @@ _stub_tkinter()
 
 # Import only pure-logic symbols — no Tk initialisation occurs at import time.
 from nlm_scrubber_mac_gui import (  # noqa: E402
+    _ALL_BIN_NAMES,
     _CONFIG_DEFAULTS,
     build_config,
+    find_installed_binary,
     gather_files,
     get_latest_scrubber_url,
     is_supported_file,
+    scrubber_binary_candidates,
     validate_path,
     verify_checksum,
 )
@@ -268,6 +271,60 @@ class TestGetLatestScrubberUrl(unittest.TestCase):
         self.assertEqual(result, DEFAULT_SCRUBBER_URL)
         log_cb.assert_called_once()
         self.assertIn("Could not check", log_cb.call_args[0][0])
+
+
+class TestScrubberBinaryCandidates(unittest.TestCase):
+    def test_preferred_first_on_darwin(self):
+        with patch("nlm_scrubber_mac_gui.platform.system", return_value="Darwin"):
+            candidates = scrubber_binary_candidates()
+        self.assertEqual(candidates[0], "scrubber.osx")
+
+    def test_preferred_first_on_linux(self):
+        with patch("nlm_scrubber_mac_gui.platform.system", return_value="Linux"):
+            candidates = scrubber_binary_candidates()
+        self.assertEqual(candidates[0], "scrubber.lnx")
+
+    def test_unknown_os_falls_back_to_all(self):
+        with patch("nlm_scrubber_mac_gui.platform.system", return_value="Plan9"):
+            candidates = scrubber_binary_candidates()
+        # No preferred, but every known binary still appears as fallback.
+        for name in _ALL_BIN_NAMES:
+            self.assertIn(name, candidates)
+
+    def test_no_duplicates(self):
+        with patch("nlm_scrubber_mac_gui.platform.system", return_value="Darwin"):
+            candidates = scrubber_binary_candidates()
+        self.assertEqual(len(candidates), len(set(candidates)))
+
+
+class TestFindInstalledBinary(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_returns_none_when_missing(self):
+        with patch("nlm_scrubber_mac_gui.SCRUBBER_DIR", self.tmp):
+            self.assertIsNone(find_installed_binary())
+
+    def test_finds_preferred_binary_first(self):
+        # Put both Linux and macOS binaries on disk; on Darwin macOS wins.
+        open(os.path.join(self.tmp, "scrubber.lnx"), "w").close()
+        open(os.path.join(self.tmp, "scrubber.osx"), "w").close()
+        with patch("nlm_scrubber_mac_gui.SCRUBBER_DIR", self.tmp), \
+             patch("nlm_scrubber_mac_gui.platform.system", return_value="Darwin"):
+            result = find_installed_binary()
+        self.assertTrue(result.endswith("scrubber.osx"))
+
+    def test_falls_back_to_any_known_binary(self):
+        # Only Linux binary present, but running on macOS — still discoverable.
+        open(os.path.join(self.tmp, "scrubber.lnx"), "w").close()
+        with patch("nlm_scrubber_mac_gui.SCRUBBER_DIR", self.tmp), \
+             patch("nlm_scrubber_mac_gui.platform.system", return_value="Darwin"):
+            result = find_installed_binary()
+        self.assertTrue(result.endswith("scrubber.lnx"))
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ Native-feeling macOS GUI wrapper for NLM Scrubber (Linux CLI version).
 
 import hashlib
 import os
+import platform
 import re
 import shutil
 import stat
@@ -27,10 +28,35 @@ DEFAULT_SCRUBBER_URL = "https://lhncbc.nlm.nih.gov/scrubber/files/scrubber.19.04
 SCRUBBER_SHA256: Optional[str] = None
 SCRUBBER_DIR = os.path.expanduser("~/.nlm_scrubber")
 SCRUBBER_ZIP = os.path.join(SCRUBBER_DIR, "scrubber.zip")
-SCRUBBER_BIN = os.path.join(SCRUBBER_DIR, "scrubber.lnx")
 CONFIG_FILE = os.path.join(SCRUBBER_DIR, "config.txt")
 
 SUPPORTED_EXTS = {".txt", ".md"}
+
+# Candidate scrubber binary filenames in NLM's distribution zip.
+# Ordered: the platform-preferred name appears first via scrubber_binary_candidates().
+_BIN_NAMES_BY_SYSTEM: dict[str, tuple[str, ...]] = {
+    "Darwin": ("scrubber.osx", "scrubber.mac", "scrubber.macos"),
+    "Linux": ("scrubber.lnx", "scrubber.linux"),
+    "Windows": ("scrubber.win.exe", "scrubber.exe"),
+}
+_ALL_BIN_NAMES: tuple[str, ...] = tuple(
+    name for names in _BIN_NAMES_BY_SYSTEM.values() for name in names
+)
+
+
+def scrubber_binary_candidates() -> tuple[str, ...]:
+    """Return candidate binary filenames, OS-preferred first, then all others as fallback."""
+    preferred = _BIN_NAMES_BY_SYSTEM.get(platform.system(), ())
+    return preferred + tuple(n for n in _ALL_BIN_NAMES if n not in preferred)
+
+
+def scrubber_bin_path() -> str:
+    """Path to the installed scrubber binary for the current OS."""
+    return os.path.join(SCRUBBER_DIR, scrubber_binary_candidates()[0])
+
+
+# Kept for backwards compatibility with existing imports / tests.
+SCRUBBER_BIN = scrubber_bin_path()
 
 
 def ensure_dir(path: str) -> None:
@@ -90,13 +116,45 @@ def get_latest_scrubber_url(log_cb: Callable[[str], None]) -> str:
         return DEFAULT_SCRUBBER_URL
 
 
+def find_installed_binary() -> Optional[str]:
+    """Return the path of an already-installed scrubber binary, OS-preferred."""
+    for name in scrubber_binary_candidates():
+        candidate = os.path.join(SCRUBBER_DIR, name)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _locate_extracted_binary() -> Optional[str]:
+    """Walk SCRUBBER_DIR after extraction and return a usable binary path.
+
+    Prefers an OS-matching binary name; falls back to any known scrubber binary.
+    Moves the chosen binary to SCRUBBER_DIR root for stable invocation.
+    """
+    preferred = scrubber_binary_candidates()
+    found: dict[str, str] = {}
+    for root, _, files in os.walk(SCRUBBER_DIR):
+        for name in files:
+            if name in _ALL_BIN_NAMES and name not in found:
+                found[name] = os.path.join(root, name)
+    for name in preferred:
+        if name in found:
+            src = found[name]
+            dest = os.path.join(SCRUBBER_DIR, name)
+            if src != dest:
+                shutil.move(src, dest)
+            return dest
+    return None
+
+
 def download_scrubber(
     progress_cb: Callable[[int], None],
     log_cb: Callable[[str], None],
     cancel_event: threading.Event,
 ) -> bool:
     ensure_dir(SCRUBBER_DIR)
-    if os.path.exists(SCRUBBER_BIN):
+    existing = find_installed_binary()
+    if existing:
         return True
 
     url = get_latest_scrubber_url(log_cb)
@@ -148,20 +206,26 @@ def download_scrubber(
             os.remove(SCRUBBER_ZIP)
         raise
 
-    if not os.path.exists(SCRUBBER_BIN):
-        for root, _, files in os.walk(SCRUBBER_DIR):
-            if "scrubber.lnx" in files:
-                shutil.move(os.path.join(root, "scrubber.lnx"), SCRUBBER_BIN)
-                break
-
-    if os.path.exists(SCRUBBER_BIN):
-        st = os.stat(SCRUBBER_BIN)
-        os.chmod(SCRUBBER_BIN, st.st_mode | stat.S_IEXEC)
-        log_cb("Scrubber ready.")
+    binary = _locate_extracted_binary()
+    if binary:
+        st = os.stat(binary)
+        os.chmod(binary, st.st_mode | stat.S_IEXEC)
+        # If this isn't the OS-preferred binary, warn — the binary may not run.
+        preferred = scrubber_binary_candidates()[0]
+        if os.path.basename(binary) != preferred:
+            log_cb(
+                f"Warning: the downloaded package does not contain {preferred} "
+                f"(only {os.path.basename(binary)} was found). It may not run on "
+                f"this platform ({platform.system()})."
+            )
+        log_cb(f"Scrubber ready: {os.path.basename(binary)}")
         progress_cb(30)
         return True
 
-    log_cb("Scrubber binary not found after extraction.")
+    log_cb(
+        "Scrubber binary not found after extraction. "
+        f"Expected one of: {', '.join(scrubber_binary_candidates())}."
+    )
     return False
 
 
@@ -223,10 +287,13 @@ class ScrubberApp:
 
         self.cancel_event = threading.Event()
         self.worker_thread: Optional[threading.Thread] = None
+        self._dnd_status = ""
 
         self._configure_style()
         self._build_ui()
         self._setup_dnd()
+        if self._dnd_status and hasattr(self, "dnd_label"):
+            self.dnd_label.configure(text=self._dnd_status)
 
     def _configure_style(self) -> None:
         style = ttk.Style()
@@ -255,6 +322,11 @@ class ScrubberApp:
         # file picker would silently open the folder picker.
         ttk.Button(input_row, text="Select File", command=self.select_input_file).pack(side="left")
         ttk.Button(input_row, text="Select Folder", command=self.select_input_folder).pack(side="left", padx=(4, 0))
+
+        # Surface drag-and-drop availability so users aren't left guessing
+        # whether the headline feature actually works on their system.
+        self.dnd_label = ttk.Label(path_frame, text="", foreground="#666")
+        self.dnd_label.pack(anchor="w", pady=(2, 0))
 
         output_row = ttk.Frame(path_frame)
         output_row.pack(fill="x", pady=4)
@@ -292,27 +364,58 @@ class ScrubberApp:
         self.cancel_button.pack(side="left", padx=8)
 
     def _setup_dnd(self) -> None:
+        """Wire up file drop support.
+
+        Two independent mechanisms:
+          1. macOS OpenDocument Apple Event — stdlib only. Fires when files are
+             dropped on the app's Dock icon or "Open With" is used. Works on
+             every stock macOS Python (no tkdnd needed).
+          2. tkdnd drop_target — handles in-window drops, but requires the
+             tkdnd Tcl package which is NOT bundled with macOS Tk. Used only
+             when available.
+        """
+        dnd_mechanisms: list[str] = []
+
+        if platform.system() == "Darwin":
+            try:
+                self.root.createcommand(
+                    "::tk::mac::OpenDocument", self._on_macos_open_document
+                )
+                dnd_mechanisms.append("Dock drop")
+            except tk.TclError as err:
+                self.log(f"macOS OpenDocument hook unavailable: {err}")
+
         try:
             self.root.tk.call("package", "require", "tkdnd")
-        except tk.TclError:
-            self.log("Drag-and-drop not available in this Tk build.")
-            return
-        try:
             self.root.tk.call("tkdnd::drop_target", "register", self.root, "*")
             self.root.bind("<<Drop>>", self._on_drop)
-        except tk.TclError as err:
-            self.log(f"Drag-and-drop setup failed: {err}")
+            dnd_mechanisms.append("in-window drop")
+        except tk.TclError:
+            pass  # tkdnd not installed — no in-window drop
+
+        if dnd_mechanisms:
+            self._dnd_status = "Drop files: " + ", ".join(dnd_mechanisms)
+        else:
+            self._dnd_status = "Drag-and-drop unavailable — use Select File/Folder"
+
+    def _on_macos_open_document(self, *paths: str) -> None:
+        self._accept_dropped_paths(list(paths))
 
     def _on_drop(self, event: tk.Event) -> None:
-        data = event.data
-        if not data:
+        if not event.data:
             return
-        paths = self._parse_dnd_paths(data)
-        if not paths:
+        self._accept_dropped_paths(self._parse_dnd_paths(event.data))
+
+    def _accept_dropped_paths(self, paths: list[str]) -> None:
+        valid = [p for p in paths if os.path.isdir(p) or os.path.isfile(p)]
+        if not valid:
             return
-        selected = paths[0]
-        if os.path.isdir(selected) or os.path.isfile(selected):
-            self.input_path.set(selected)
+        if len(valid) > 1:
+            self.log(
+                f"Received {len(valid)} dropped items; using the first "
+                f"({valid[0]}). Drop a folder to process multiple files."
+            )
+        self.input_path.set(valid[0])
 
     def _parse_dnd_paths(self, data: str) -> list[str]:
         if data.startswith("{") and data.endswith("}"):
@@ -501,7 +604,11 @@ class ScrubberApp:
             self.log("Configuration generated.")
             self.set_progress(35)
 
-            cmd = [SCRUBBER_BIN, CONFIG_FILE]
+            binary = find_installed_binary()
+            if not binary:
+                self._finish(False, "Scrubber binary not found after install.")
+                return
+            cmd = [binary, CONFIG_FILE]
             self.log(f"Running: {' '.join(cmd)}")
 
             try:
@@ -515,6 +622,20 @@ class ScrubberApp:
                 code = self._stream_subprocess(process)
             except FileNotFoundError:
                 self._finish(False, "Scrubber binary not found.")
+                return
+            except OSError as err:
+                # Exec format errors on macOS show up here (e.g. running a Linux
+                # ELF binary on Darwin). Translate to something actionable.
+                if "Exec format" in str(err) or getattr(err, "errno", None) == 8:
+                    self._finish(
+                        False,
+                        f"The scrubber binary ({os.path.basename(binary)}) is not "
+                        f"executable on this OS ({platform.system()}). NLM may not "
+                        "ship a native build for your platform — try running through "
+                        "Docker or a Linux VM.",
+                    )
+                    return
+                self._finish(False, f"Error running scrubber: {err}")
                 return
             except Exception as err:
                 self._finish(False, f"Error running scrubber: {err}")
