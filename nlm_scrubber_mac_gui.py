@@ -5,6 +5,7 @@ Native-feeling macOS GUI wrapper for NLM Scrubber (Linux CLI version).
 """
 
 import hashlib
+import json
 import os
 import platform
 import re
@@ -29,6 +30,8 @@ SCRUBBER_SHA256: Optional[str] = None
 SCRUBBER_DIR = os.path.expanduser("~/.nlm_scrubber")
 SCRUBBER_ZIP = os.path.join(SCRUBBER_DIR, "scrubber.zip")
 CONFIG_FILE = os.path.join(SCRUBBER_DIR, "config.txt")
+SETTINGS_FILE = os.path.join(SCRUBBER_DIR, "settings.json")
+USER_DICT_FILE = os.path.join(SCRUBBER_DIR, "user_dict.txt")
 
 SUPPORTED_EXTS = {".txt", ".md", ".pdf", ".docx"}
 TEXT_EXTS = {".txt", ".md"}
@@ -124,6 +127,77 @@ def find_installed_binary() -> Optional[str]:
         if os.path.exists(candidate):
             return candidate
     return None
+
+
+def run_with_docker(
+    binary: str,
+    config_file: str,
+    input_dir: str,
+    output_dir: str,
+    log_cb: Callable[[str], None],
+    cancel_event: threading.Event,
+) -> Optional[subprocess.Popen]:
+    """Return a Popen running the scrubber inside Docker, or None on failure.
+
+    Mounts SCRUBBER_DIR as /scrubber, input_dir as /input (ro), and
+    output_dir as /output inside an ubuntu:22.04 container.  The config
+    file is rewritten with these container-internal paths before launch.
+    """
+    try:
+        check = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            timeout=5,
+        )
+        if check.returncode != 0:
+            log_cb("Docker is not running. Start Docker Desktop and retry.")
+            return None
+    except FileNotFoundError:
+        log_cb("Docker not found. Install Docker Desktop from docker.com.")
+        return None
+    except subprocess.TimeoutExpired:
+        log_cb("docker info timed out — Docker may not be running.")
+        return None
+
+    # Rewrite config so paths are valid inside the container.
+    docker_config = os.path.join(SCRUBBER_DIR, "config_docker.txt")
+    try:
+        with open(config_file, encoding="utf-8") as f:
+            cfg = f.read()
+        cfg = cfg.replace(f"input_dir={input_dir}", "input_dir=/input")
+        cfg = cfg.replace(f"output_dir={output_dir}", "output_dir=/output")
+        if "user_dictionary_file=" in cfg:
+            cfg = re.sub(
+                r"user_dictionary_file=.*",
+                f"user_dictionary_file=/scrubber/{os.path.basename(USER_DICT_FILE)}",
+                cfg,
+            )
+        with open(docker_config, "w", encoding="utf-8") as f:
+            f.write(cfg)
+    except OSError as err:
+        log_cb(f"Could not write Docker config: {err}")
+        return None
+
+    bin_name = os.path.basename(binary)
+    cmd = [
+        "docker", "run", "--rm",
+        "-v", f"{SCRUBBER_DIR}:/scrubber",
+        "-v", f"{input_dir}:/input:ro",
+        "-v", f"{output_dir}:/output",
+        "ubuntu:22.04",
+        f"/scrubber/{bin_name}", "/scrubber/config_docker.txt",
+    ]
+    log_cb("Launching scrubber via Docker: " + " ".join(cmd))
+    try:
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except OSError as err:
+        log_cb(f"Failed to start Docker container: {err}")
+        return None
 
 
 def _locate_extracted_binary() -> Optional[str]:
@@ -260,6 +334,7 @@ def build_config(
     output_dir: str,
     use_surrogates: bool,
     detector_overrides: Optional[dict[str, bool]] = None,
+    user_dict_path: Optional[str] = None,
 ) -> str:
     """Write the scrubber config file.
 
@@ -282,6 +357,8 @@ def build_config(
         *detector_lines,
         surrogate_line,
     ]
+    if user_dict_path and os.path.exists(user_dict_path):
+        lines.append(f"user_dictionary_file={user_dict_path}")
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     return CONFIG_FILE
@@ -362,6 +439,23 @@ def gather_files(input_path: str) -> list[str]:
     return files
 
 
+def load_settings() -> dict:
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(settings: dict) -> None:
+    ensure_dir(SCRUBBER_DIR)
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except OSError:
+        pass
+
+
 class ScrubberApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -372,6 +466,8 @@ class ScrubberApp:
         self.input_path = tk.StringVar()
         self.output_path = tk.StringVar()
         self.use_surrogates = tk.BooleanVar(value=False)
+        self.log_to_file = tk.BooleanVar(value=False)
+        self.use_docker = tk.BooleanVar(value=False)
         self.progress_value = tk.IntVar(value=0)
 
         # One BooleanVar per detector for the UI checkboxes.
@@ -387,12 +483,48 @@ class ScrubberApp:
         # Most-recent run results, for the Preview tab and clipboard copy.
         self._diff_pairs: list[tuple[str, str, str]] = []  # (label, original, anonymized)
         self._redaction_counts: dict[str, int] = {}
+        self._custom_terms: str = ""
+        self._log_file_handle: Optional[object] = None
+        self._log_output_dir: str = ""
 
         self._configure_style()
         self._build_ui()
+        self._load_settings()
         self._setup_dnd()
         if self._dnd_status and hasattr(self, "dnd_label"):
             self.dnd_label.configure(text=self._dnd_status)
+
+    def _load_settings(self) -> None:
+        s = load_settings()
+        if s.get("output_path"):
+            self.output_path.set(s["output_path"])
+        if s.get("use_surrogates") is not None:
+            self.use_surrogates.set(bool(s["use_surrogates"]))
+        if s.get("log_to_file") is not None:
+            self.log_to_file.set(bool(s["log_to_file"]))
+        if s.get("use_docker") is not None:
+            self.use_docker.set(bool(s["use_docker"]))
+        detectors = s.get("detectors", {})
+        for key, var in self.phi_vars.items():
+            if key in detectors:
+                var.set(bool(detectors[key]))
+        terms = s.get("custom_terms", "")
+        if terms and hasattr(self, "custom_terms_text"):
+            self.custom_terms_text.delete("1.0", "end")
+            self.custom_terms_text.insert("1.0", terms)
+
+    def _save_settings(self) -> None:
+        terms = ""
+        if hasattr(self, "custom_terms_text"):
+            terms = self.custom_terms_text.get("1.0", "end").strip()
+        save_settings({
+            "output_path": self.output_path.get(),
+            "use_surrogates": self.use_surrogates.get(),
+            "log_to_file": self.log_to_file.get(),
+            "use_docker": self.use_docker.get(),
+            "detectors": {key: var.get() for key, var in self.phi_vars.items()},
+            "custom_terms": terms,
+        })
 
     def _configure_style(self) -> None:
         style = ttk.Style()
@@ -441,6 +573,10 @@ class ScrubberApp:
             text="Enable surrogate replacements (replace PHI with plausible fakes instead of [PHI] tags)",
             variable=self.use_surrogates,
         ).pack(anchor="w")
+        ttk.Checkbutton(options_frame, text="Save log to file (in output folder)", variable=self.log_to_file).pack(anchor="w")
+        docker_row = ttk.Frame(options_frame)
+        docker_row.pack(anchor="w", fill="x")
+        ttk.Checkbutton(docker_row, text="Run scrubber via Docker (required on macOS if no native binary)", variable=self.use_docker).pack(side="left", anchor="w")
 
         detectors_frame = ttk.LabelFrame(main, text="PHI Detectors")
         detectors_frame.pack(fill="x", padx=10, pady=(8, 0))
@@ -452,6 +588,11 @@ class ScrubberApp:
             )
         for c in range(3):
             detectors_frame.columnconfigure(c, weight=1)
+
+        custom_frame = ttk.LabelFrame(main, text="Custom PHI terms (one per line — names/IDs the scrubber might miss)")
+        custom_frame.pack(fill="x", padx=10, pady=(8, 0))
+        self.custom_terms_text = tk.Text(custom_frame, height=3, wrap="word")
+        self.custom_terms_text.pack(fill="x", padx=4, pady=4)
 
         progress_frame = ttk.Frame(main)
         progress_frame.pack(fill="x", padx=10, pady=8)
@@ -623,10 +764,17 @@ class ScrubberApp:
     def log(self, message: str) -> None:
         def append() -> None:
             timestamp = time.strftime("%H:%M:%S")
+            line = f"[{timestamp}] {message}\n"
             self.log_text.configure(state="normal")
-            self.log_text.insert("end", f"[{timestamp}] {message}\n")
+            self.log_text.insert("end", line)
             self.log_text.configure(state="disabled")
             self.log_text.see("end")
+            if self._log_file_handle is not None:
+                try:
+                    self._log_file_handle.write(line)
+                    self._log_file_handle.flush()
+                except OSError:
+                    pass
 
         if threading.current_thread() is threading.main_thread():
             append()
@@ -664,6 +812,17 @@ class ScrubberApp:
             messagebox.showerror(APP_TITLE, "Please select an output folder.")
             return
         ensure_dir(output_path)
+        self._save_settings()
+
+        if self.log_to_file.get() and output_path:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            log_path = os.path.join(output_path, f"scrubber_log_{ts}.txt")
+            try:
+                self._log_file_handle = open(log_path, "w", encoding="utf-8")
+            except OSError:
+                self._log_file_handle = None
+        else:
+            self._log_file_handle = None
 
         files = gather_files(input_path)
         if not files:
@@ -674,6 +833,9 @@ class ScrubberApp:
             return
 
         detector_overrides = {key: var.get() for key, var in self.phi_vars.items()}
+        self._custom_terms = ""
+        if hasattr(self, "custom_terms_text"):
+            self._custom_terms = self.custom_terms_text.get("1.0", "end").strip()
 
         self.cancel_event.clear()
         self.progress_value.set(0)
