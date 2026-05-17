@@ -30,7 +30,8 @@ SCRUBBER_DIR = os.path.expanduser("~/.nlm_scrubber")
 SCRUBBER_ZIP = os.path.join(SCRUBBER_DIR, "scrubber.zip")
 CONFIG_FILE = os.path.join(SCRUBBER_DIR, "config.txt")
 
-SUPPORTED_EXTS = {".txt", ".md"}
+SUPPORTED_EXTS = {".txt", ".md", ".pdf", ".docx"}
+TEXT_EXTS = {".txt", ".md"}
 
 # Candidate scrubber binary filenames in NLM's distribution zip.
 # Ordered: the platform-preferred name appears first via scrubber_binary_candidates().
@@ -229,36 +230,124 @@ def download_scrubber(
     return False
 
 
+# PHI detectors exposed as checkboxes in the UI.
+# (config_key, display_label, default_enabled)
+PHI_DETECTORS: list[tuple[str, str, bool]] = [
+    ("find_date", "Dates", True),
+    ("find_patient", "Patient names", True),
+    ("find_doctor", "Doctor names", True),
+    ("find_hospital", "Hospitals", True),
+    ("find_unique_id", "Unique IDs (MRN, SSN, ...)", True),
+    ("find_phone", "Phone numbers", True),
+    ("find_email", "Email addresses", True),
+    ("find_url", "URLs", True),
+    ("find_age", "Ages over 89", True),
+    ("find_state", "US states", True),
+    ("find_city", "Cities", True),
+    ("find_rated_number", "Rated numbers (experimental)", False),
+]
+
+# Fixed (non-toggleable) defaults; kept here so existing imports/tests still work.
 _CONFIG_DEFAULTS = [
     "input_type=txt",
     "output_type=txt",
-    "find_rated_number=no",
-    "find_date=yes",
-    "find_patient=yes",
-    "find_doctor=yes",
-    "find_hospital=yes",
-    "find_unique_id=yes",
-    "find_url=yes",
-    "find_phone=yes",
-    "find_email=yes",
-    "find_age=yes",
-    "find_state=yes",
-    "find_city=yes",
+    *[f"{key}={'yes' if default else 'no'}" for key, _, default in PHI_DETECTORS],
 ]
 
 
-def build_config(input_dir: str, output_dir: str, use_surrogates: bool) -> str:
+def build_config(
+    input_dir: str,
+    output_dir: str,
+    use_surrogates: bool,
+    detector_overrides: Optional[dict[str, bool]] = None,
+) -> str:
+    """Write the scrubber config file.
+
+    *detector_overrides* lets callers (the UI) flip individual PHI detectors
+    on/off. Keys must match the first column of PHI_DETECTORS; unknown keys
+    are ignored. If None, the PHI_DETECTORS defaults are used.
+    """
     ensure_dir(SCRUBBER_DIR)
+    overrides = detector_overrides or {}
+    detector_lines = [
+        f"{key}={'yes' if overrides.get(key, default) else 'no'}"
+        for key, _, default in PHI_DETECTORS
+    ]
     surrogate_line = "use_surrogates=yes" if use_surrogates else "use_surrogates=no"
     lines = [
         f"input_dir={input_dir}",
         f"output_dir={output_dir}",
-        *_CONFIG_DEFAULTS,
+        "input_type=txt",
+        "output_type=txt",
+        *detector_lines,
         surrogate_line,
     ]
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     return CONFIG_FILE
+
+
+# ---------------------------------------------------------------------------
+# Text extraction from PDF and DOCX (stdlib only for DOCX; pdftotext for PDF).
+# ---------------------------------------------------------------------------
+
+_DOCX_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def extract_text_from_docx(path: str) -> str:
+    """Plain text from a .docx file using only stdlib (zipfile + ElementTree)."""
+    import xml.etree.ElementTree as ET
+
+    with zipfile.ZipFile(path, "r") as z:
+        with z.open("word/document.xml") as f:
+            tree = ET.parse(f)
+    paragraphs: list[str] = []
+    for para in tree.iter(f"{_DOCX_NS}p"):
+        runs = [t.text or "" for t in para.iter(f"{_DOCX_NS}t")]
+        paragraphs.append("".join(runs))
+    return "\n".join(paragraphs)
+
+
+def extract_text_from_pdf(path: str, log_cb: Callable[[str], None]) -> Optional[str]:
+    """Plain text from a PDF using `pdftotext` (poppler).
+
+    Returns None if pdftotext isn't installed or extraction fails. macOS users
+    can install it with: brew install poppler.
+    """
+    try:
+        result = subprocess.run(
+            ["pdftotext", "-layout", "-enc", "UTF-8", path, "-"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        log_cb(
+            "pdftotext not found — cannot extract PDF text. "
+            "Install with: brew install poppler"
+        )
+        return None
+    if result.returncode != 0:
+        log_cb(f"pdftotext failed for {os.path.basename(path)}: {result.stderr.strip()}")
+        return None
+    return result.stdout
+
+
+def extract_text(path: str, log_cb: Callable[[str], None]) -> Optional[str]:
+    """Dispatch to the right extractor based on extension. None on failure."""
+    ext = os.path.splitext(path.lower())[1]
+    if ext in TEXT_EXTS:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    if ext == ".docx":
+        try:
+            return extract_text_from_docx(path)
+        except (zipfile.BadZipFile, KeyError) as err:
+            log_cb(f"Could not read DOCX {os.path.basename(path)}: {err}")
+            return None
+    if ext == ".pdf":
+        return extract_text_from_pdf(path, log_cb)
+    return None
 
 
 def gather_files(input_path: str) -> list[str]:
@@ -277,17 +366,27 @@ class ScrubberApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("760x520")
-        self.root.minsize(720, 500)
+        self.root.geometry("900x720")
+        self.root.minsize(820, 640)
 
         self.input_path = tk.StringVar()
         self.output_path = tk.StringVar()
         self.use_surrogates = tk.BooleanVar(value=False)
         self.progress_value = tk.IntVar(value=0)
 
+        # One BooleanVar per detector for the UI checkboxes.
+        self.phi_vars: dict[str, tk.BooleanVar] = {
+            key: tk.BooleanVar(value=default)
+            for key, _, default in PHI_DETECTORS
+        }
+
         self.cancel_event = threading.Event()
         self.worker_thread: Optional[threading.Thread] = None
         self._dnd_status = ""
+
+        # Most-recent run results, for the Preview tab and clipboard copy.
+        self._diff_pairs: list[tuple[str, str, str]] = []  # (label, original, anonymized)
+        self._redaction_counts: dict[str, int] = {}
 
         self._configure_style()
         self._build_ui()
@@ -337,7 +436,22 @@ class ScrubberApp:
 
         options_frame = ttk.LabelFrame(main, text="Options")
         options_frame.pack(fill="x", padx=10)
-        ttk.Checkbutton(options_frame, text="Enable surrogate replacements", variable=self.use_surrogates).pack(anchor="w")
+        ttk.Checkbutton(
+            options_frame,
+            text="Enable surrogate replacements (replace PHI with plausible fakes instead of [PHI] tags)",
+            variable=self.use_surrogates,
+        ).pack(anchor="w")
+
+        detectors_frame = ttk.LabelFrame(main, text="PHI Detectors")
+        detectors_frame.pack(fill="x", padx=10, pady=(8, 0))
+        # Lay out checkboxes in a 3-column grid for compactness.
+        for i, (key, label, _) in enumerate(PHI_DETECTORS):
+            row, col = divmod(i, 3)
+            ttk.Checkbutton(detectors_frame, text=label, variable=self.phi_vars[key]).grid(
+                row=row, column=col, sticky="w", padx=4, pady=2
+            )
+        for c in range(3):
+            detectors_frame.columnconfigure(c, weight=1)
 
         progress_frame = ttk.Frame(main)
         progress_frame.pack(fill="x", padx=10, pady=8)
@@ -346,15 +460,54 @@ class ScrubberApp:
         self.status_label = ttk.Label(progress_frame, text="")
         self.status_label.pack(anchor="w", pady=(2, 0))
 
-        log_frame = ttk.LabelFrame(main, text="Log")
-        log_frame.pack(fill="both", expand=True, padx=10, pady=8)
+        # Tabbed view: log on one tab, before/after preview on another, summary on a third.
+        self.notebook = ttk.Notebook(main)
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=8)
 
-        self.log_text = tk.Text(log_frame, height=12, wrap="word")
+        log_tab = ttk.Frame(self.notebook)
+        self.notebook.add(log_tab, text="Log")
+        self.log_text = tk.Text(log_tab, height=12, wrap="word")
         self.log_text.configure(state="disabled")
-        log_scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        log_scroll = ttk.Scrollbar(log_tab, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scroll.set)
         self.log_text.pack(side="left", fill="both", expand=True)
         log_scroll.pack(side="right", fill="y")
+
+        preview_tab = ttk.Frame(self.notebook)
+        self.notebook.add(preview_tab, text="Preview")
+        picker_row = ttk.Frame(preview_tab)
+        picker_row.pack(fill="x")
+        ttk.Label(picker_row, text="File:").pack(side="left", padx=(4, 4))
+        self.preview_picker = ttk.Combobox(picker_row, state="readonly")
+        self.preview_picker.pack(side="left", fill="x", expand=True, padx=4)
+        self.preview_picker.bind("<<ComboboxSelected>>", self._on_preview_selected)
+        self.copy_button = ttk.Button(
+            picker_row, text="Copy anonymized to clipboard",
+            command=self._copy_to_clipboard, state="disabled",
+        )
+        self.copy_button.pack(side="left", padx=4)
+
+        diff_row = ttk.Frame(preview_tab)
+        diff_row.pack(fill="both", expand=True, pady=(4, 0))
+        original_frame = ttk.LabelFrame(diff_row, text="Original")
+        original_frame.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        self.original_text = tk.Text(original_frame, wrap="word")
+        self.original_text.configure(state="disabled")
+        self.original_text.pack(fill="both", expand=True)
+        anonymized_frame = ttk.LabelFrame(diff_row, text="Anonymized")
+        anonymized_frame.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        self.anonymized_text = tk.Text(anonymized_frame, wrap="word")
+        self.anonymized_text.configure(state="disabled")
+        self.anonymized_text.pack(fill="both", expand=True)
+        # Tag config: red for removed PHI, green for inserted surrogate/placeholder.
+        self.original_text.tag_configure("removed", background="#ffe2e2")
+        self.anonymized_text.tag_configure("added", background="#dcffd8")
+
+        report_tab = ttk.Frame(self.notebook)
+        self.notebook.add(report_tab, text="Report")
+        self.report_text = tk.Text(report_tab, wrap="word")
+        self.report_text.configure(state="disabled")
+        self.report_text.pack(fill="both", expand=True)
 
         button_frame = ttk.Frame(main)
         button_frame.pack(fill="x", padx=10, pady=10)
@@ -446,7 +599,13 @@ class ScrubberApp:
     def select_input_file(self) -> None:
         path = filedialog.askopenfilename(
             title="Select input file",
-            filetypes=[("Text/Markdown", "*.txt *.md"), ("All files", "*.*")],
+            filetypes=[
+                ("Supported", "*.txt *.md *.pdf *.docx"),
+                ("Text/Markdown", "*.txt *.md"),
+                ("PDF", "*.pdf"),
+                ("Word", "*.docx"),
+                ("All files", "*.*"),
+            ],
         )
         if path:
             self.input_path.set(path)
@@ -508,18 +667,30 @@ class ScrubberApp:
 
         files = gather_files(input_path)
         if not files:
-            messagebox.showerror(APP_TITLE, "No .txt or .md files found in the selected input.")
+            messagebox.showerror(
+                APP_TITLE,
+                "No supported files found. Accepted: .txt, .md, .pdf, .docx",
+            )
             return
+
+        detector_overrides = {key: var.get() for key, var in self.phi_vars.items()}
 
         self.cancel_event.clear()
         self.progress_value.set(0)
         self._set_status("Starting...")
         self.start_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
+        self.copy_button.configure(state="disabled")
 
         self.worker_thread = threading.Thread(
             target=self._run_scrubber,
-            args=(input_path, output_path, self.use_surrogates.get(), files),
+            args=(
+                input_path,
+                output_path,
+                self.use_surrogates.get(),
+                files,
+                detector_overrides,
+            ),
             daemon=True,
         )
         self.worker_thread.start()
@@ -529,20 +700,61 @@ class ScrubberApp:
         self.log("Cancellation requested.")
         self._set_status("Cancelling...")
 
-    def _prepare_input_dir(self, input_path: str) -> str:
-        """Copy a single file into a temp dir so the scrubber receives a directory.
+    def _prepare_input_files(
+        self, files: list[str]
+    ) -> tuple[str, list[tuple[str, str]]]:
+        """Build a temp dir of .txt copies for the scrubber.
 
-        Returns the temp dir path; the caller is responsible for cleanup.
-        Raises RuntimeError on failure.
+        Returns (temp_dir, prepared) where prepared is a list of
+        (original_path, temp_txt_basename) so we can later pair input and
+        output for the diff view. .txt/.md files are copied as-is (with a
+        .txt extension); .pdf/.docx files are extracted to text first.
+        Raises RuntimeError if no file could be prepared.
         """
         temp_dir = tempfile.mkdtemp(prefix="nlm_scrubber_input_", dir=SCRUBBER_DIR)
-        try:
-            shutil.copy2(input_path, temp_dir)
-            self.log(f"Copied file into temporary input folder: {temp_dir}")
-        except OSError as err:
+        prepared: list[tuple[str, str]] = []
+        used_names: set[str] = set()
+
+        def _unique(base: str) -> str:
+            # Disambiguate so two source files with the same name don't collide.
+            candidate = base
+            i = 1
+            while candidate in used_names:
+                stem, ext = os.path.splitext(base)
+                candidate = f"{stem}_{i}{ext}"
+                i += 1
+            used_names.add(candidate)
+            return candidate
+
+        for src in files:
+            ext = os.path.splitext(src.lower())[1]
+            txt_name = _unique(os.path.splitext(os.path.basename(src))[0] + ".txt")
+            dest = os.path.join(temp_dir, txt_name)
+            if ext in TEXT_EXTS:
+                try:
+                    shutil.copyfile(src, dest)
+                except OSError as err:
+                    self.log(f"Skipping {os.path.basename(src)}: {err}")
+                    continue
+            else:
+                text = extract_text(src, self.log)
+                if text is None:
+                    self.log(f"Skipping {os.path.basename(src)}: extraction failed.")
+                    continue
+                try:
+                    with open(dest, "w", encoding="utf-8") as f:
+                        f.write(text)
+                except OSError as err:
+                    self.log(f"Skipping {os.path.basename(src)}: {err}")
+                    continue
+            prepared.append((src, txt_name))
+
+        if not prepared:
             shutil.rmtree(temp_dir, ignore_errors=True)
-            raise RuntimeError(f"Failed to prepare input file: {err}") from err
-        return temp_dir
+            raise RuntimeError("No input files could be prepared (extraction failures only).")
+
+        self.log(f"Prepared {len(prepared)} file(s) in {temp_dir}")
+        return temp_dir, prepared
 
     def _stream_subprocess(self, process: subprocess.Popen) -> int:
         """Forward stdout of *process* to the log; terminate cleanly on cancel.
@@ -572,8 +784,10 @@ class ScrubberApp:
         output_path: str,
         use_surrogates: bool,
         files: list[str],
+        detector_overrides: dict[str, bool],
     ) -> None:
         temp_input_dir: Optional[str] = None
+        prepared: list[tuple[str, str]] = []
         try:
             self._set_status("Downloading scrubber...")
             try:
@@ -588,19 +802,15 @@ class ScrubberApp:
                 self._finish(False, "Operation cancelled before start.")
                 return
 
-            if os.path.isfile(input_path):
-                try:
-                    temp_input_dir = self._prepare_input_dir(input_path)
-                except RuntimeError as err:
-                    self._finish(False, str(err))
-                    return
-                effective_input = temp_input_dir
-            else:
-                effective_input = input_path
+            try:
+                temp_input_dir, prepared = self._prepare_input_files(files)
+            except RuntimeError as err:
+                self._finish(False, str(err))
+                return
 
-            self.log(f"Preparing to scrub {len(files)} file(s).")
-            self._set_status(f"Scrubbing {len(files)} file(s)...")
-            build_config(effective_input, output_path, use_surrogates)
+            self.log(f"Preparing to scrub {len(prepared)} file(s).")
+            self._set_status(f"Scrubbing {len(prepared)} file(s)...")
+            build_config(temp_input_dir, output_path, use_surrogates, detector_overrides)
             self.log("Configuration generated.")
             self.set_progress(35)
 
@@ -649,12 +859,177 @@ class ScrubberApp:
                 self._finish(False, f"Scrubber exited with code {code}.")
                 return
 
+            self.set_progress(95)
+            self._set_status("Computing diff and report...")
+            self._populate_results(temp_input_dir, output_path, prepared)
             self.set_progress(100)
             self._set_status("Complete")
             self._finish(True, "Anonymization complete.", output_path)
         finally:
             if temp_input_dir:
                 shutil.rmtree(temp_input_dir, ignore_errors=True)
+
+    def _populate_results(
+        self,
+        temp_input_dir: str,
+        output_path: str,
+        prepared: list[tuple[str, str]],
+    ) -> None:
+        """Read input/output text pairs, store them for the Preview tab, and
+        compute redaction counts for the Report tab.
+
+        The scrubber writes output files alongside the temp .txt name, often
+        with a suffix/prefix variation. We find the matching output file by
+        looking for files whose name contains the input stem.
+        """
+        diff_pairs: list[tuple[str, str, str]] = []
+        counts: dict[str, int] = {
+            "Total PHI tokens replaced": 0,
+            "Dates": 0,
+            "Names": 0,
+            "Numbers/IDs": 0,
+            "Locations": 0,
+            "Other": 0,
+        }
+
+        try:
+            output_files = os.listdir(output_path)
+        except OSError:
+            output_files = []
+
+        for original_path, txt_name in prepared:
+            stem = os.path.splitext(txt_name)[0]
+            input_full = os.path.join(temp_input_dir, txt_name)
+            try:
+                with open(input_full, encoding="utf-8", errors="replace") as f:
+                    original_text = f.read()
+            except OSError:
+                continue
+
+            # Find an output file whose name references this input.
+            match = next(
+                (n for n in output_files if stem in n),
+                None,
+            )
+            if not match:
+                continue
+            try:
+                with open(os.path.join(output_path, match), encoding="utf-8", errors="replace") as f:
+                    anonymized_text = f.read()
+            except OSError:
+                continue
+
+            label = os.path.basename(original_path)
+            diff_pairs.append((label, original_text, anonymized_text))
+            self._tally_redactions(anonymized_text, counts)
+
+        self._diff_pairs = diff_pairs
+        self._redaction_counts = counts
+        self.root.after(0, self._refresh_results_ui)
+
+    @staticmethod
+    def _tally_redactions(anonymized: str, counts: dict[str, int]) -> None:
+        """NLM Scrubber emits tokens like **DATE**, **NAME[xxx]**, etc.
+        Count them by category. Surrogate-replacement output won't have these
+        tokens, so the report will be empty in that mode — that's expected.
+        """
+        for token in re.findall(r"\*\*([A-Z\-]+)(?:\[[^\]]*\])?\*\*", anonymized):
+            counts["Total PHI tokens replaced"] += 1
+            t = token.upper()
+            if "DATE" in t or "TIME" in t:
+                counts["Dates"] += 1
+            elif "NAME" in t or "PATIENT" in t or "DOCTOR" in t:
+                counts["Names"] += 1
+            elif "ID" in t or "NUM" in t or "PHONE" in t or "MRN" in t or "SSN" in t:
+                counts["Numbers/IDs"] += 1
+            elif (
+                "CITY" in t or "STATE" in t or "ADDRESS" in t
+                or "HOSPITAL" in t or "LOC" in t
+            ):
+                counts["Locations"] += 1
+            else:
+                counts["Other"] += 1
+
+    def _refresh_results_ui(self) -> None:
+        labels = [pair[0] for pair in self._diff_pairs]
+        self.preview_picker["values"] = labels
+        if labels:
+            self.preview_picker.current(0)
+            self._render_preview(0)
+            self.copy_button.configure(state="normal")
+        else:
+            self._render_empty_preview()
+            self.copy_button.configure(state="disabled")
+        self._render_report()
+
+    def _on_preview_selected(self, _event: object) -> None:
+        idx = self.preview_picker.current()
+        if 0 <= idx < len(self._diff_pairs):
+            self._render_preview(idx)
+
+    def _render_preview(self, index: int) -> None:
+        import difflib
+
+        _, original, anonymized = self._diff_pairs[index]
+        self.original_text.configure(state="normal")
+        self.anonymized_text.configure(state="normal")
+        self.original_text.delete("1.0", "end")
+        self.anonymized_text.delete("1.0", "end")
+
+        matcher = difflib.SequenceMatcher(a=original, b=anonymized, autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            orig_chunk = original[i1:i2]
+            anon_chunk = anonymized[j1:j2]
+            if tag == "equal":
+                self.original_text.insert("end", orig_chunk)
+                self.anonymized_text.insert("end", anon_chunk)
+            elif tag == "delete":
+                self.original_text.insert("end", orig_chunk, ("removed",))
+            elif tag == "insert":
+                self.anonymized_text.insert("end", anon_chunk, ("added",))
+            else:  # replace
+                self.original_text.insert("end", orig_chunk, ("removed",))
+                self.anonymized_text.insert("end", anon_chunk, ("added",))
+
+        self.original_text.configure(state="disabled")
+        self.anonymized_text.configure(state="disabled")
+
+    def _render_empty_preview(self) -> None:
+        for widget in (self.original_text, self.anonymized_text):
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("end", "(no output to preview)")
+            widget.configure(state="disabled")
+
+    def _render_report(self) -> None:
+        self.report_text.configure(state="normal")
+        self.report_text.delete("1.0", "end")
+        if not self._diff_pairs:
+            self.report_text.insert("end", "No results yet.")
+        else:
+            lines = [f"Files processed: {len(self._diff_pairs)}", ""]
+            for key, val in self._redaction_counts.items():
+                lines.append(f"  {key}: {val}")
+            if self.use_surrogates.get():
+                lines += [
+                    "",
+                    "Note: surrogate replacement is enabled. Counts above only",
+                    "reflect ** PHI ** tokens; with surrogates, PHI is replaced",
+                    "in-place with realistic-looking fakes and won't appear here.",
+                    "Use the Preview tab to see the highlighted changes instead.",
+                ]
+            self.report_text.insert("end", "\n".join(lines))
+        self.report_text.configure(state="disabled")
+
+    def _copy_to_clipboard(self) -> None:
+        idx = self.preview_picker.current()
+        if not (0 <= idx < len(self._diff_pairs)):
+            return
+        _, _, anonymized = self._diff_pairs[idx]
+        self.root.clipboard_clear()
+        self.root.clipboard_append(anonymized)
+        self.root.update()  # keep clipboard alive after window closes
+        self.log("Anonymized text copied to clipboard.")
 
     def _finish(self, success: bool, message: str, output_path: Optional[str] = None) -> None:
         def finish_ui() -> None:
@@ -663,6 +1038,9 @@ class ScrubberApp:
             self._set_status("")
             if success:
                 self.log(message)
+                if self._diff_pairs:
+                    # Jump to the Preview tab so users immediately see the result.
+                    self.notebook.select(1)
                 if output_path:
                     if messagebox.askyesno(APP_TITLE, f"{message}\n\nReveal output folder?"):
                         open_in_finder(output_path)

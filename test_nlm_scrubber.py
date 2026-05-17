@@ -44,7 +44,9 @@ _stub_tkinter()
 from nlm_scrubber_mac_gui import (  # noqa: E402
     _ALL_BIN_NAMES,
     _CONFIG_DEFAULTS,
+    PHI_DETECTORS,
     build_config,
+    extract_text_from_docx,
     find_installed_binary,
     gather_files,
     get_latest_scrubber_url,
@@ -62,8 +64,15 @@ class TestIsSupportedFile(unittest.TestCase):
     def test_md_supported(self):
         self.assertTrue(is_supported_file("README.MD"))  # case-insensitive
 
-    def test_pdf_unsupported(self):
-        self.assertFalse(is_supported_file("record.pdf"))
+    def test_pdf_supported(self):
+        # PDF is now a supported input — extracted via pdftotext.
+        self.assertTrue(is_supported_file("record.pdf"))
+
+    def test_docx_supported(self):
+        self.assertTrue(is_supported_file("note.docx"))
+
+    def test_unrelated_unsupported(self):
+        self.assertFalse(is_supported_file("scan.tiff"))
 
     def test_no_extension(self):
         self.assertFalse(is_supported_file("Makefile"))
@@ -142,9 +151,11 @@ class TestGatherFiles(unittest.TestCase):
         self._touch("a.txt")
         self._touch("b.md")
         self._touch("c.pdf")
+        self._touch("d.docx")
+        self._touch("e.png")  # not supported
         result = gather_files(self.tmp)
         names = {os.path.basename(p) for p in result}
-        self.assertEqual(names, {"a.txt", "b.md"})
+        self.assertEqual(names, {"a.txt", "b.md", "c.pdf", "d.docx"})
 
     def test_empty_directory(self):
         self.assertEqual(gather_files(self.tmp), [])
@@ -226,6 +237,97 @@ class TestBuildConfig(unittest.TestCase):
         finally:
             m.SCRUBBER_DIR = orig_dir
             m.CONFIG_FILE = orig_cfg
+
+    def test_detector_overrides_disable(self):
+        import nlm_scrubber_mac_gui as m
+        orig_dir, orig_cfg = m.SCRUBBER_DIR, m.CONFIG_FILE
+        cfg_path = os.path.join(self.tmp, "config.txt")
+        m.SCRUBBER_DIR = self.tmp
+        m.CONFIG_FILE = cfg_path
+        try:
+            build_config(
+                "/in", "/out", use_surrogates=False,
+                detector_overrides={"find_email": False, "find_phone": False},
+            )
+            with open(cfg_path) as f:
+                content = f.read()
+            self.assertIn("find_email=no", content)
+            self.assertIn("find_phone=no", content)
+            # An untouched default should remain enabled.
+            self.assertIn("find_date=yes", content)
+        finally:
+            m.SCRUBBER_DIR = orig_dir
+            m.CONFIG_FILE = orig_cfg
+
+    def test_detector_overrides_enable_experimental(self):
+        import nlm_scrubber_mac_gui as m
+        orig_dir, orig_cfg = m.SCRUBBER_DIR, m.CONFIG_FILE
+        cfg_path = os.path.join(self.tmp, "config.txt")
+        m.SCRUBBER_DIR = self.tmp
+        m.CONFIG_FILE = cfg_path
+        try:
+            # find_rated_number defaults to False; override flips it on.
+            build_config(
+                "/in", "/out", use_surrogates=False,
+                detector_overrides={"find_rated_number": True},
+            )
+            with open(cfg_path) as f:
+                content = f.read()
+            self.assertIn("find_rated_number=yes", content)
+        finally:
+            m.SCRUBBER_DIR = orig_dir
+            m.CONFIG_FILE = orig_cfg
+
+
+class TestPhiDetectorsRegistry(unittest.TestCase):
+    def test_all_entries_have_three_columns(self):
+        for entry in PHI_DETECTORS:
+            self.assertEqual(len(entry), 3)
+            key, label, default = entry
+            self.assertTrue(key.startswith("find_"))
+            self.assertIsInstance(label, str)
+            self.assertIsInstance(default, bool)
+
+    def test_keys_are_unique(self):
+        keys = [k for k, _, _ in PHI_DETECTORS]
+        self.assertEqual(len(keys), len(set(keys)))
+
+
+class TestExtractTextFromDocx(unittest.TestCase):
+    """Build a minimal valid .docx in-memory and verify extraction."""
+
+    def _make_docx(self, paragraphs: list[str]) -> str:
+        import zipfile as zf
+        path = tempfile.mkstemp(suffix=".docx")[1]
+        ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        body = "".join(
+            f'<w:p><w:r><w:t xml:space="preserve">{p}</w:t></w:r></w:p>'
+            for p in paragraphs
+        )
+        document_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<w:document xmlns:w="{ns}"><w:body>{body}</w:body></w:document>'
+        )
+        with zf.ZipFile(path, "w") as z:
+            z.writestr("word/document.xml", document_xml)
+        return path
+
+    def test_extracts_paragraphs(self):
+        path = self._make_docx(["Hello world", "Patient: John Doe"])
+        try:
+            text = extract_text_from_docx(path)
+            self.assertIn("Hello world", text)
+            self.assertIn("Patient: John Doe", text)
+        finally:
+            os.unlink(path)
+
+    def test_preserves_paragraph_order(self):
+        path = self._make_docx(["one", "two", "three"])
+        try:
+            text = extract_text_from_docx(path)
+            self.assertEqual(text.splitlines(), ["one", "two", "three"])
+        finally:
+            os.unlink(path)
 
 
 class TestGetLatestScrubberUrl(unittest.TestCase):
