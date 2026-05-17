@@ -596,5 +596,60 @@ class TestBuildConfigUserDict(unittest.TestCase):
             self._teardown_module(m)
 
 
+class TestPartialOutputCleanup(unittest.TestCase):
+    """The cleanup helpers are static methods on ScrubberApp but pure-logic;
+    we instantiate via the class object without ever building a Tk root.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _touch(self, relpath: str) -> None:
+        full = os.path.join(self.tmp, relpath)
+        os.makedirs(os.path.dirname(full) or self.tmp, exist_ok=True)
+        open(full, "w").close()
+
+    def _snapshot(self) -> set:
+        from nlm_scrubber_mac_gui import ScrubberApp
+        return ScrubberApp._snapshot_dir(self.tmp)
+
+    def _cleanup(self, snapshot: set) -> int:
+        from nlm_scrubber_mac_gui import ScrubberApp
+        return ScrubberApp._cleanup_partial_output(self.tmp, snapshot)
+
+    def test_snapshot_empty_dir(self):
+        self.assertEqual(self._snapshot(), set())
+
+    def test_snapshot_finds_nested_files(self):
+        self._touch("a.txt")
+        self._touch("sub/b.txt")
+        snap = self._snapshot()
+        self.assertIn("a.txt", snap)
+        self.assertIn(os.path.join("sub", "b.txt"), snap)
+
+    def test_cleanup_removes_only_new_files(self):
+        self._touch("keep.txt")
+        snap_before = self._snapshot()
+        # Scrubber "writes" two new files.
+        self._touch("new1.txt")
+        self._touch("sub/new2.txt")
+        removed = self._cleanup(snap_before)
+        self.assertEqual(removed, 2)
+        # Pre-existing file untouched; new files gone.
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "keep.txt")))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "new1.txt")))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "sub", "new2.txt")))
+        # Empty subdir created by scrubber is also tidied.
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "sub")))
+
+    def test_cleanup_handles_missing_dir(self):
+        import nlm_scrubber_mac_gui as m
+        self.assertEqual(m.ScrubberApp._cleanup_partial_output("/nonexistent/path", set()), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

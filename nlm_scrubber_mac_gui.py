@@ -955,6 +955,48 @@ class ScrubberApp:
                 pass
             time.sleep(0.25)
 
+    @staticmethod
+    def _snapshot_dir(path: str) -> set[str]:
+        """Return the set of relative file paths currently inside *path*."""
+        snapshot: set[str] = set()
+        if not os.path.isdir(path):
+            return snapshot
+        for root, _, files in os.walk(path):
+            for name in files:
+                snapshot.add(os.path.relpath(os.path.join(root, name), path))
+        return snapshot
+
+    @staticmethod
+    def _cleanup_partial_output(path: str, pre_existing: set[str]) -> int:
+        """Delete files in *path* that did not exist in the *pre_existing* snapshot.
+
+        Returns the number of files removed. Empty directories left behind are
+        also cleaned up. Pre-existing files are never touched.
+        """
+        if not os.path.isdir(path):
+            return 0
+        removed = 0
+        for root, _, files in os.walk(path):
+            for name in files:
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, path)
+                if rel in pre_existing:
+                    continue
+                try:
+                    os.remove(full)
+                    removed += 1
+                except OSError:
+                    pass
+        # Tidy up subdirs that the scrubber created and are now empty.
+        for root, dirs, _ in os.walk(path, topdown=False):
+            for name in dirs:
+                full = os.path.join(root, name)
+                try:
+                    os.rmdir(full)
+                except OSError:
+                    pass  # not empty or in-use — leave it alone
+        return removed
+
     def _stream_subprocess(self, process: subprocess.Popen) -> int:
         """Forward stdout of *process* to the log; terminate cleanly on cancel.
 
@@ -1031,6 +1073,10 @@ class ScrubberApp:
             cmd = [binary, CONFIG_FILE]
             self.log(f"Running: {' '.join(cmd)}")
 
+            # Snapshot output dir so we can clean up files we wrote if cancelled,
+            # without touching files the user already had there.
+            pre_existing_output = self._snapshot_dir(output_path)
+
             process: Optional[subprocess.Popen] = None
             try:
                 process = subprocess.Popen(
@@ -1079,6 +1125,9 @@ class ScrubberApp:
                 watcher.join(timeout=1)
 
             if code == -1:
+                removed = self._cleanup_partial_output(output_path, pre_existing_output)
+                if removed:
+                    self.log(f"Removed {removed} partial output file(s) created during the cancelled run.")
                 self._finish(False, "Operation cancelled.")
                 return
 
