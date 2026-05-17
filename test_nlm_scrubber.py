@@ -51,6 +51,8 @@ from nlm_scrubber_mac_gui import (  # noqa: E402
     gather_files,
     get_latest_scrubber_url,
     is_supported_file,
+    load_settings,
+    save_settings,
     scrubber_binary_candidates,
     validate_path,
     verify_checksum,
@@ -427,6 +429,171 @@ class TestFindInstalledBinary(unittest.TestCase):
              patch("nlm_scrubber_mac_gui.platform.system", return_value="Darwin"):
             result = find_installed_binary()
         self.assertTrue(result.endswith("scrubber.lnx"))
+
+
+class TestSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_load_returns_empty_dict_when_missing(self):
+        import nlm_scrubber_mac_gui as m
+        orig = m.SETTINGS_FILE
+        m.SETTINGS_FILE = os.path.join(self.tmp, "nonexistent_settings.json")
+        try:
+            result = load_settings()
+            self.assertEqual(result, {})
+        finally:
+            m.SETTINGS_FILE = orig
+
+    def test_save_and_load_roundtrip(self):
+        import nlm_scrubber_mac_gui as m
+        orig_settings = m.SETTINGS_FILE
+        orig_dir = m.SCRUBBER_DIR
+        m.SCRUBBER_DIR = self.tmp
+        m.SETTINGS_FILE = os.path.join(self.tmp, "settings.json")
+        try:
+            data = {
+                "output_path": "/tmp/out",
+                "use_surrogates": True,
+                "log_to_file": False,
+                "use_docker": False,
+                "detectors": {"find_date": True, "find_phone": False},
+                "custom_terms": "John Doe\nMRN-12345",
+            }
+            save_settings(data)
+            loaded = load_settings()
+            self.assertEqual(loaded, data)
+        finally:
+            m.SCRUBBER_DIR = orig_dir
+            m.SETTINGS_FILE = orig_settings
+
+    def test_save_handles_oserror_gracefully(self):
+        import nlm_scrubber_mac_gui as m
+        orig_settings = m.SETTINGS_FILE
+        orig_dir = m.SCRUBBER_DIR
+        m.SCRUBBER_DIR = self.tmp
+        m.SETTINGS_FILE = os.path.join(self.tmp, "settings.json")
+        try:
+            # Patch open so writing raises OSError — should be swallowed silently.
+            with patch("builtins.open", side_effect=OSError("disk full")):
+                save_settings({"key": "value"})  # must not raise
+        finally:
+            m.SCRUBBER_DIR = orig_dir
+            m.SETTINGS_FILE = orig_settings
+
+    def test_load_handles_corrupt_json_gracefully(self):
+        import nlm_scrubber_mac_gui as m
+        orig = m.SETTINGS_FILE
+        bad_json = os.path.join(self.tmp, "bad.json")
+        with open(bad_json, "w") as f:
+            f.write("{not valid json")
+        m.SETTINGS_FILE = bad_json
+        try:
+            result = load_settings()
+            self.assertEqual(result, {})
+        finally:
+            m.SETTINGS_FILE = orig
+
+
+class TestGatherFilesNested(unittest.TestCase):
+    """Test gather_files with deeper nesting to cover structure preservation."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_gather_files_deeply_nested_returns_all_supported(self):
+        # Create a 3-level nested structure.
+        deep = os.path.join(self.tmp, "a", "b", "c")
+        os.makedirs(deep)
+        paths = []
+        for name in ("one.txt", "two.md", "three.pdf"):
+            p = os.path.join(deep, name)
+            open(p, "w").close()
+            paths.append(p)
+        unsupported = os.path.join(deep, "skip.tiff")
+        open(unsupported, "w").close()
+
+        result = gather_files(self.tmp)
+        result_set = set(result)
+        for p in paths:
+            self.assertIn(p, result_set)
+        self.assertNotIn(unsupported, result_set)
+
+    def test_gather_files_mixed_levels(self):
+        # Files at root level and in sub-dirs all collected.
+        root_file = os.path.join(self.tmp, "root.txt")
+        open(root_file, "w").close()
+        sub = os.path.join(self.tmp, "sub")
+        os.makedirs(sub)
+        sub_file = os.path.join(sub, "sub.docx")
+        open(sub_file, "w").close()
+
+        result = gather_files(self.tmp)
+        self.assertIn(root_file, result)
+        self.assertIn(sub_file, result)
+
+
+class TestBuildConfigUserDict(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _setup_module(self):
+        import nlm_scrubber_mac_gui as m
+        self._orig_dir = m.SCRUBBER_DIR
+        self._orig_cfg = m.CONFIG_FILE
+        m.SCRUBBER_DIR = self.tmp
+        m.CONFIG_FILE = os.path.join(self.tmp, "config.txt")
+        return m
+
+    def _teardown_module(self, m):
+        m.SCRUBBER_DIR = self._orig_dir
+        m.CONFIG_FILE = self._orig_cfg
+
+    def test_build_config_user_dict_included_when_file_exists(self):
+        m = self._setup_module()
+        try:
+            dict_file = os.path.join(self.tmp, "user_dict.txt")
+            with open(dict_file, "w") as f:
+                f.write("John Doe\nMRN-99999\n")
+            result = build_config("/in", "/out", use_surrogates=False, user_dict_path=dict_file)
+            with open(result) as f:
+                content = f.read()
+            self.assertIn(f"user_dictionary_file={dict_file}", content)
+        finally:
+            self._teardown_module(m)
+
+    def test_build_config_user_dict_omitted_when_file_missing(self):
+        m = self._setup_module()
+        try:
+            nonexistent = os.path.join(self.tmp, "missing_dict.txt")
+            result = build_config("/in", "/out", use_surrogates=False, user_dict_path=nonexistent)
+            with open(result) as f:
+                content = f.read()
+            self.assertNotIn("user_dictionary_file", content)
+        finally:
+            self._teardown_module(m)
+
+    def test_build_config_user_dict_omitted_when_not_provided(self):
+        m = self._setup_module()
+        try:
+            result = build_config("/in", "/out", use_surrogates=False)
+            with open(result) as f:
+                content = f.read()
+            self.assertNotIn("user_dictionary_file", content)
+        finally:
+            self._teardown_module(m)
 
 
 if __name__ == "__main__":

@@ -863,35 +863,51 @@ class ScrubberApp:
         self._set_status("Cancelling...")
 
     def _prepare_input_files(
-        self, files: list[str]
+        self, files: list[str], input_root: Optional[str] = None
     ) -> tuple[str, list[tuple[str, str]]]:
-        """Build a temp dir of .txt copies for the scrubber.
+        """Build a temp dir of .txt copies for the scrubber, preserving folder structure.
+
+        If *input_root* is provided (the original top-level input folder), output
+        files are placed at the same relative path inside the temp dir so the
+        scrubber (and later _populate_results) can mirror that structure.
 
         Returns (temp_dir, prepared) where prepared is a list of
-        (original_path, temp_txt_basename) so we can later pair input and
-        output for the diff view. .txt/.md files are copied as-is (with a
-        .txt extension); .pdf/.docx files are extracted to text first.
-        Raises RuntimeError if no file could be prepared.
+        (original_path, relative_txt_path).
         """
         temp_dir = tempfile.mkdtemp(prefix="nlm_scrubber_input_", dir=SCRUBBER_DIR)
         prepared: list[tuple[str, str]] = []
-        used_names: set[str] = set()
+        used_relpaths: set[str] = set()
 
-        def _unique(base: str) -> str:
-            # Disambiguate so two source files with the same name don't collide.
-            candidate = base
+        def _unique_relpath(relpath: str) -> str:
+            candidate = relpath
             i = 1
-            while candidate in used_names:
-                stem, ext = os.path.splitext(base)
+            while candidate in used_relpaths:
+                stem, ext = os.path.splitext(relpath)
                 candidate = f"{stem}_{i}{ext}"
                 i += 1
-            used_names.add(candidate)
+            used_relpaths.add(candidate)
             return candidate
 
         for src in files:
             ext = os.path.splitext(src.lower())[1]
-            txt_name = _unique(os.path.splitext(os.path.basename(src))[0] + ".txt")
-            dest = os.path.join(temp_dir, txt_name)
+            stem = os.path.splitext(os.path.basename(src))[0]
+            # Compute the relative path from input_root for structure preservation.
+            if input_root and os.path.isdir(input_root):
+                try:
+                    rel_dir = os.path.relpath(os.path.dirname(src), input_root)
+                except ValueError:
+                    rel_dir = ""
+            else:
+                rel_dir = ""
+            # Normalise: "." means same level as root
+            if rel_dir == ".":
+                rel_dir = ""
+            rel_txt = _unique_relpath(
+                os.path.join(rel_dir, stem + ".txt") if rel_dir else stem + ".txt"
+            )
+            dest = os.path.join(temp_dir, rel_txt)
+            ensure_dir(os.path.dirname(dest))
+
             if ext in TEXT_EXTS:
                 try:
                     shutil.copyfile(src, dest)
@@ -909,7 +925,7 @@ class ScrubberApp:
                 except OSError as err:
                     self.log(f"Skipping {os.path.basename(src)}: {err}")
                     continue
-            prepared.append((src, txt_name))
+            prepared.append((src, rel_txt))
 
         if not prepared:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -917,6 +933,27 @@ class ScrubberApp:
 
         self.log(f"Prepared {len(prepared)} file(s) in {temp_dir}")
         return temp_dir, prepared
+
+    def _watch_output_progress(
+        self,
+        output_dir: str,
+        total_files: int,
+        stop_event: threading.Event,
+    ) -> None:
+        """Poll output_dir and update the progress bar as output files appear."""
+        seen: set[str] = set()
+        while not stop_event.is_set():
+            try:
+                current = set(os.listdir(output_dir)) - seen
+                if current:
+                    seen |= current
+                    n = len(seen)
+                    pct = 35 + int(n / total_files * 55)
+                    self.set_progress(min(pct, 90))
+                    self._set_status(f"Scrubbing... {n}/{total_files} file(s) done")
+            except OSError:
+                pass
+            time.sleep(0.25)
 
     def _stream_subprocess(self, process: subprocess.Popen) -> int:
         """Forward stdout of *process* to the log; terminate cleanly on cancel.
@@ -965,14 +1002,25 @@ class ScrubberApp:
                 return
 
             try:
-                temp_input_dir, prepared = self._prepare_input_files(files)
+                input_root = input_path if os.path.isdir(input_path) else None
+                temp_input_dir, prepared = self._prepare_input_files(files, input_root=input_root)
             except RuntimeError as err:
                 self._finish(False, str(err))
                 return
 
             self.log(f"Preparing to scrub {len(prepared)} file(s).")
             self._set_status(f"Scrubbing {len(prepared)} file(s)...")
-            build_config(temp_input_dir, output_path, use_surrogates, detector_overrides)
+
+            # Write custom user dictionary if user provided any terms.
+            user_dict_path: Optional[str] = None
+            if self._custom_terms.strip():
+                ensure_dir(SCRUBBER_DIR)
+                with open(USER_DICT_FILE, "w", encoding="utf-8") as _f:
+                    _f.write(self._custom_terms)
+                user_dict_path = USER_DICT_FILE
+                self.log(f"Custom dictionary: {len([t for t in self._custom_terms.splitlines() if t.strip()])} term(s).")
+
+            build_config(temp_input_dir, output_path, use_surrogates, detector_overrides, user_dict_path)
             self.log("Configuration generated.")
             self.set_progress(35)
 
@@ -983,6 +1031,7 @@ class ScrubberApp:
             cmd = [binary, CONFIG_FILE]
             self.log(f"Running: {' '.join(cmd)}")
 
+            process: Optional[subprocess.Popen] = None
             try:
                 process = subprocess.Popen(
                     cmd,
@@ -991,27 +1040,43 @@ class ScrubberApp:
                     text=True,
                     cwd=SCRUBBER_DIR,
                 )
-                code = self._stream_subprocess(process)
             except FileNotFoundError:
                 self._finish(False, "Scrubber binary not found.")
                 return
             except OSError as err:
-                # Exec format errors on macOS show up here (e.g. running a Linux
-                # ELF binary on Darwin). Translate to something actionable.
                 if "Exec format" in str(err) or getattr(err, "errno", None) == 8:
-                    self._finish(
-                        False,
-                        f"The scrubber binary ({os.path.basename(binary)}) is not "
-                        f"executable on this OS ({platform.system()}). NLM may not "
-                        "ship a native build for your platform — try running through "
-                        "Docker or a Linux VM.",
+                    self.log("Native binary cannot run on this OS — trying Docker fallback...")
+                    process = run_with_docker(
+                        binary, CONFIG_FILE, temp_input_dir, output_path,
+                        self.log, self.cancel_event,
                     )
+                    if process is None:
+                        self._finish(
+                            False,
+                            f"Scrubber binary is not executable on this OS "
+                            f"({platform.system()}) and Docker fallback failed. "
+                            "Install Docker Desktop or run on Linux.",
+                        )
+                        return
+                else:
+                    self._finish(False, f"Error running scrubber: {err}")
                     return
-                self._finish(False, f"Error running scrubber: {err}")
-                return
             except Exception as err:
                 self._finish(False, f"Error running scrubber: {err}")
                 return
+
+            stop_watcher = threading.Event()
+            watcher = threading.Thread(
+                target=self._watch_output_progress,
+                args=(output_path, len(prepared), stop_watcher),
+                daemon=True,
+            )
+            watcher.start()
+            try:
+                code = self._stream_subprocess(process)
+            finally:
+                stop_watcher.set()
+                watcher.join(timeout=1)
 
             if code == -1:
                 self._finish(False, "Operation cancelled.")
@@ -1054,29 +1119,43 @@ class ScrubberApp:
             "Other": 0,
         }
 
-        try:
-            output_files = os.listdir(output_path)
-        except OSError:
-            output_files = []
-
-        for original_path, txt_name in prepared:
-            stem = os.path.splitext(txt_name)[0]
-            input_full = os.path.join(temp_input_dir, txt_name)
+        for original_path, rel_txt in prepared:
+            stem = os.path.splitext(os.path.basename(rel_txt))[0]
+            rel_dir = os.path.dirname(rel_txt)
+            input_full = os.path.join(temp_input_dir, rel_txt)
             try:
                 with open(input_full, encoding="utf-8", errors="replace") as f:
                     original_text = f.read()
             except OSError:
                 continue
 
-            # Find an output file whose name references this input.
-            match = next(
-                (n for n in output_files if stem in n),
-                None,
-            )
-            if not match:
+            # The scrubber may output to output_path flat or with structure.
+            # Check both the flat location and the relative-path location.
+            flat_output = os.path.join(output_path, os.path.basename(rel_txt))
+            structured_output = os.path.join(output_path, rel_txt)
+            output_file: Optional[str] = None
+            if os.path.exists(structured_output):
+                output_file = structured_output
+            elif os.path.exists(flat_output):
+                # Scrubber wrote flat; move it to the structured location.
+                if rel_dir:
+                    ensure_dir(os.path.join(output_path, rel_dir))
+                    shutil.move(flat_output, structured_output)
+                    output_file = structured_output
+                else:
+                    output_file = flat_output
+            else:
+                # Fall back: search for any output file whose name contains the stem.
+                output_file = next(
+                    (os.path.join(output_path, n)
+                     for n in os.listdir(output_path)
+                     if stem in n),
+                    None,
+                )
+            if not output_file:
                 continue
             try:
-                with open(os.path.join(output_path, match), encoding="utf-8", errors="replace") as f:
+                with open(output_file, encoding="utf-8", errors="replace") as f:
                     anonymized_text = f.read()
             except OSError:
                 continue
@@ -1198,6 +1277,12 @@ class ScrubberApp:
             self.start_button.configure(state="normal")
             self.cancel_button.configure(state="disabled")
             self._set_status("")
+            if self._log_file_handle is not None:
+                try:
+                    self._log_file_handle.close()
+                except OSError:
+                    pass
+                self._log_file_handle = None
             if success:
                 self.log(message)
                 if self._diff_pairs:
