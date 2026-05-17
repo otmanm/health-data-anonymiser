@@ -47,6 +47,8 @@ from nlm_scrubber_mac_gui import (  # noqa: E402
     PHI_DETECTORS,
     build_config,
     extract_text_from_docx,
+    extract_text_from_pdf,
+    extract_text_from_pdf_ocr,
     find_installed_binary,
     gather_files,
     get_latest_scrubber_url,
@@ -594,6 +596,86 @@ class TestBuildConfigUserDict(unittest.TestCase):
             self.assertNotIn("user_dictionary_file", content)
         finally:
             self._teardown_module(m)
+
+
+class TestPdfOcrFallback(unittest.TestCase):
+    """Verify that PDFs with no text layer trigger OCR, and that missing
+    tools degrade gracefully without crashing the extractor.
+    """
+
+    def _completed(self, stdout: str = "", returncode: int = 0, stderr: str = ""):
+        result = MagicMock()
+        result.stdout = stdout
+        result.returncode = returncode
+        result.stderr = stderr
+        return result
+
+    def test_pdf_with_text_does_not_invoke_ocr(self):
+        log_cb = MagicMock()
+        # pdftotext returns real text — OCR path must not be touched.
+        with patch(
+            "nlm_scrubber_mac_gui.subprocess.run",
+            return_value=self._completed(stdout="real PDF text"),
+        ) as mock_run, patch(
+            "nlm_scrubber_mac_gui.extract_text_from_pdf_ocr"
+        ) as mock_ocr:
+            result = extract_text_from_pdf("/fake.pdf", log_cb)
+        self.assertEqual(result, "real PDF text")
+        mock_ocr.assert_not_called()
+        mock_run.assert_called_once()
+
+    def test_pdf_with_empty_text_triggers_ocr(self):
+        log_cb = MagicMock()
+        with patch(
+            "nlm_scrubber_mac_gui.subprocess.run",
+            return_value=self._completed(stdout="   \n\n"),
+        ), patch(
+            "nlm_scrubber_mac_gui.extract_text_from_pdf_ocr",
+            return_value="ocr extracted text",
+        ) as mock_ocr:
+            result = extract_text_from_pdf("/scanned.pdf", log_cb)
+        self.assertEqual(result, "ocr extracted text")
+        mock_ocr.assert_called_once()
+
+    def test_pdftotext_missing_returns_none(self):
+        log_cb = MagicMock()
+        with patch(
+            "nlm_scrubber_mac_gui.subprocess.run",
+            side_effect=FileNotFoundError(),
+        ):
+            self.assertIsNone(extract_text_from_pdf("/x.pdf", log_cb))
+        log_cb.assert_called_once()
+        self.assertIn("pdftotext not found", log_cb.call_args[0][0])
+
+    def test_ocr_requires_both_tools(self):
+        log_cb = MagicMock()
+        # pdftoppm exists, tesseract missing.
+        def which(name):
+            return "/usr/bin/pdftoppm" if name == "pdftoppm" else None
+        with patch("nlm_scrubber_mac_gui.shutil.which", side_effect=which):
+            result = extract_text_from_pdf_ocr("/x.pdf", log_cb)
+        self.assertIsNone(result)
+        log_cb.assert_called_once()
+        self.assertIn("tesseract", log_cb.call_args[0][0])
+
+    def test_ocr_concatenates_page_text(self):
+        log_cb = MagicMock()
+        # Pretend both tools exist.
+        with patch("nlm_scrubber_mac_gui.shutil.which", return_value="/usr/bin/x"), \
+             patch("nlm_scrubber_mac_gui.tempfile.TemporaryDirectory") as mock_td, \
+             patch("nlm_scrubber_mac_gui.subprocess.run") as mock_run, \
+             patch("nlm_scrubber_mac_gui.os.listdir", return_value=["page-1.png", "page-2.png"]):
+            # tempfile context manager — yield a fake dir path.
+            mock_td.return_value.__enter__.return_value = "/tmp/fake"
+            mock_td.return_value.__exit__.return_value = False
+            # subprocess.run is called once for pdftoppm, then once per page for tesseract.
+            mock_run.side_effect = [
+                self._completed(),  # pdftoppm
+                self._completed(stdout="page 1 text"),
+                self._completed(stdout="page 2 text"),
+            ]
+            result = extract_text_from_pdf_ocr("/scanned.pdf", log_cb)
+        self.assertEqual(result, "page 1 text\npage 2 text")
 
 
 class TestPartialOutputCleanup(unittest.TestCase):

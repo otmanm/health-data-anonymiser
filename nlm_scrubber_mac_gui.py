@@ -385,11 +385,57 @@ def extract_text_from_docx(path: str) -> str:
     return "\n".join(paragraphs)
 
 
+def extract_text_from_pdf_ocr(path: str, log_cb: Callable[[str], None]) -> Optional[str]:
+    """OCR fallback for scanned PDFs: rasterise with pdftoppm, then run tesseract.
+
+    Returns None if pdftoppm or tesseract isn't installed, or extraction fails.
+    Install on macOS with: brew install poppler tesseract.
+    """
+    for tool in ("pdftoppm", "tesseract"):
+        if shutil.which(tool) is None:
+            log_cb(
+                f"OCR fallback unavailable: {tool} not found. "
+                "Install with: brew install poppler tesseract"
+            )
+            return None
+
+    with tempfile.TemporaryDirectory(prefix="nlm_ocr_") as tmp:
+        prefix = os.path.join(tmp, "page")
+        try:
+            subprocess.run(
+                ["pdftoppm", "-r", "300", "-png", path, prefix],
+                check=True, capture_output=True, timeout=300,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
+            log_cb(f"pdftoppm failed during OCR for {os.path.basename(path)}: {err}")
+            return None
+
+        pages = sorted(f for f in os.listdir(tmp) if f.endswith(".png"))
+        if not pages:
+            log_cb(f"OCR: no pages rasterised from {os.path.basename(path)}.")
+            return None
+
+        texts: list[str] = []
+        for page in pages:
+            try:
+                result = subprocess.run(
+                    ["tesseract", os.path.join(tmp, page), "-", "-l", "eng"],
+                    check=True, capture_output=True, text=True, timeout=120,
+                )
+                texts.append(result.stdout)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
+                log_cb(f"tesseract failed on {page}: {err}")
+                continue
+
+        return "\n".join(texts) if texts else None
+
+
 def extract_text_from_pdf(path: str, log_cb: Callable[[str], None]) -> Optional[str]:
     """Plain text from a PDF using `pdftotext` (poppler).
 
-    Returns None if pdftotext isn't installed or extraction fails. macOS users
-    can install it with: brew install poppler.
+    Falls back to OCR (pdftoppm + tesseract) if the PDF has no text layer.
+    Returns None if all extraction methods fail. macOS users can install
+    both toolchains with: brew install poppler tesseract.
     """
     try:
         result = subprocess.run(
@@ -407,7 +453,20 @@ def extract_text_from_pdf(path: str, log_cb: Callable[[str], None]) -> Optional[
     if result.returncode != 0:
         log_cb(f"pdftotext failed for {os.path.basename(path)}: {result.stderr.strip()}")
         return None
-    return result.stdout
+    text = result.stdout
+    # Scanned PDFs have no text layer; pdftotext returns empty output. Fall back
+    # to OCR so they don't slip through silently.
+    if not text.strip():
+        log_cb(
+            f"PDF {os.path.basename(path)} has no text layer; attempting OCR "
+            "(this may take a minute per page)..."
+        )
+        ocr_text = extract_text_from_pdf_ocr(path, log_cb)
+        if ocr_text and ocr_text.strip():
+            log_cb(f"OCR extracted {len(ocr_text):,} characters from {os.path.basename(path)}.")
+            return ocr_text
+        return None
+    return text
 
 
 def extract_text(path: str, log_cb: Callable[[str], None]) -> Optional[str]:
