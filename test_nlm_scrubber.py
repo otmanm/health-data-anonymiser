@@ -733,5 +733,41 @@ class TestPartialOutputCleanup(unittest.TestCase):
         self.assertEqual(m.ScrubberApp._cleanup_partial_output("/nonexistent/path", set()), 0)
 
 
+class TestTallyRedactions(unittest.TestCase):
+    """_tally_redactions routes token categories, including EU/Spain validator
+    tokens which must land in their own bucket, not Numbers/IDs.
+    """
+
+    def _counts(self) -> dict:
+        return {
+            "Total PHI tokens replaced": 0,
+            "Dates": 0,
+            "Names": 0,
+            "Numbers/IDs": 0,
+            "Locations": 0,
+            "EU/Spain IDs": 0,
+            "Other": 0,
+        }
+
+    def test_eu_tokens_routed_to_own_bucket(self):
+        from nlm_scrubber_mac_gui import ScrubberApp
+        counts = self._counts()
+        text = "**NAME** has **ES_DNI**, **IBAN**, **ES_PHONE** on **DATE**"
+        ScrubberApp._tally_redactions(text, counts)
+        self.assertEqual(counts["EU/Spain IDs"], 3)
+        self.assertEqual(counts["Names"], 1)
+        self.assertEqual(counts["Dates"], 1)
+        # EU tokens must NOT leak into the generic Numbers/IDs bucket.
+        self.assertEqual(counts["Numbers/IDs"], 0)
+        self.assertEqual(counts["Total PHI tokens replaced"], 5)
+
+    def test_us_id_tokens_still_numbers(self):
+        from nlm_scrubber_mac_gui import ScrubberApp
+        counts = self._counts()
+        ScrubberApp._tally_redactions("**SSN** and **PHONE**", counts)
+        self.assertEqual(counts["Numbers/IDs"], 2)
+        self.assertEqual(counts["EU/Spain IDs"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

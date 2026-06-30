@@ -22,6 +22,8 @@ import zipfile
 from urllib import request
 from urllib.error import URLError, HTTPError
 
+from validators import EU_VALIDATORS, apply_validators
+
 APP_TITLE = "NLM Scrubber (macOS GUI Wrapper)"
 DEFAULT_SCRUBBER_URL = "https://lhncbc.nlm.nih.gov/scrubber/files/scrubber.19.0403L.zip"
 # SHA-256 digest of the expected zip. Set to None to skip verification.
@@ -535,6 +537,12 @@ class ScrubberApp:
             for key, _, default in PHI_DETECTORS
         }
 
+        # One BooleanVar per EU/Spain identifier validator.
+        self.eu_vars: dict[str, tk.BooleanVar] = {
+            key: tk.BooleanVar(value=default)
+            for key, _, default, _ in EU_VALIDATORS
+        }
+
         self.cancel_event = threading.Event()
         self.worker_thread: Optional[threading.Thread] = None
         self._dnd_status = ""
@@ -543,6 +551,7 @@ class ScrubberApp:
         self._diff_pairs: list[tuple[str, str, str]] = []  # (label, original, anonymized)
         self._redaction_counts: dict[str, int] = {}
         self._custom_terms: str = ""
+        self._enabled_eu: set[str] = set()
         self._log_file_handle: Optional[object] = None
         self._log_output_dir: str = ""
 
@@ -567,6 +576,10 @@ class ScrubberApp:
         for key, var in self.phi_vars.items():
             if key in detectors:
                 var.set(bool(detectors[key]))
+        eu = s.get("eu_validators", {})
+        for key, var in self.eu_vars.items():
+            if key in eu:
+                var.set(bool(eu[key]))
         terms = s.get("custom_terms", "")
         if terms and hasattr(self, "custom_terms_text"):
             self.custom_terms_text.delete("1.0", "end")
@@ -582,6 +595,7 @@ class ScrubberApp:
             "log_to_file": self.log_to_file.get(),
             "use_docker": self.use_docker.get(),
             "detectors": {key: var.get() for key, var in self.phi_vars.items()},
+            "eu_validators": {key: var.get() for key, var in self.eu_vars.items()},
             "custom_terms": terms,
         })
 
@@ -647,6 +661,18 @@ class ScrubberApp:
             )
         for c in range(3):
             detectors_frame.columnconfigure(c, weight=1)
+
+        # EU / Spain identifiers: a second pass of deterministic, checksum-validated
+        # recognizers that NLM Scrubber (US-centric) does not cover.
+        eu_frame = ttk.LabelFrame(main, text="EU / Spain identifiers (checksum-validated second pass)")
+        eu_frame.pack(fill="x", padx=10, pady=(8, 0))
+        for i, (key, label, _, _) in enumerate(EU_VALIDATORS):
+            row, col = divmod(i, 3)
+            ttk.Checkbutton(eu_frame, text=label, variable=self.eu_vars[key]).grid(
+                row=row, column=col, sticky="w", padx=4, pady=2
+            )
+        for c in range(3):
+            eu_frame.columnconfigure(c, weight=1)
 
         custom_frame = ttk.LabelFrame(main, text="Custom PHI terms (one per line — names/IDs the scrubber might miss)")
         custom_frame.pack(fill="x", padx=10, pady=(8, 0))
@@ -892,6 +918,9 @@ class ScrubberApp:
             return
 
         detector_overrides = {key: var.get() for key, var in self.phi_vars.items()}
+        # Tk variables must be read on the main thread; snapshot the enabled
+        # EU validators here and hand the set to the worker thread.
+        self._enabled_eu = {key for key, var in self.eu_vars.items() if var.get()}
         self._custom_terms = ""
         if hasattr(self, "custom_terms_text"):
             self._custom_terms = self.custom_terms_text.get("1.0", "end").strip()
@@ -1194,6 +1223,10 @@ class ScrubberApp:
                 self._finish(False, f"Scrubber exited with code {code}.")
                 return
 
+            if self._enabled_eu:
+                self._set_status("Applying EU/Spain validators...")
+                self._apply_eu_validators(output_path, prepared)
+
             self.set_progress(95)
             self._set_status("Computing diff and report...")
             self._populate_results(temp_input_dir, output_path, prepared)
@@ -1203,6 +1236,71 @@ class ScrubberApp:
         finally:
             if temp_input_dir:
                 shutil.rmtree(temp_input_dir, ignore_errors=True)
+
+    @staticmethod
+    def _resolve_output_file(output_path: str, rel_txt: str) -> Optional[str]:
+        """Locate the scrubber's output file for a given prepared input.
+
+        The scrubber may write output flat or with the input's subdirectory
+        structure, and may vary the filename slightly. Checks the structured
+        location, then the flat location (moving it into place to preserve
+        structure), then falls back to a stem-name search.
+        """
+        stem = os.path.splitext(os.path.basename(rel_txt))[0]
+        rel_dir = os.path.dirname(rel_txt)
+        flat_output = os.path.join(output_path, os.path.basename(rel_txt))
+        structured_output = os.path.join(output_path, rel_txt)
+        if os.path.exists(structured_output):
+            return structured_output
+        if os.path.exists(flat_output):
+            if rel_dir:
+                ensure_dir(os.path.join(output_path, rel_dir))
+                shutil.move(flat_output, structured_output)
+                return structured_output
+            return flat_output
+        try:
+            return next(
+                (os.path.join(output_path, n)
+                 for n in os.listdir(output_path)
+                 if stem in n),
+                None,
+            )
+        except OSError:
+            return None
+
+    def _apply_eu_validators(
+        self,
+        output_path: str,
+        prepared: list[tuple[str, str]],
+    ) -> None:
+        """Second pass: rewrite each scrubber output file in place, replacing
+        checksum-validated EU/Spain identifiers with ``**TOKEN**`` placeholders.
+
+        Runs before _populate_results so the new tokens flow into the diff and
+        report automatically. Uses self._enabled_eu (snapshotted on the main
+        thread in start()).
+        """
+        total = 0
+        for _original_path, rel_txt in prepared:
+            output_file = self._resolve_output_file(output_path, rel_txt)
+            if not output_file:
+                continue
+            try:
+                with open(output_file, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            new_text, counts = apply_validators(text, self._enabled_eu)
+            hits = sum(counts.values())
+            if hits:
+                try:
+                    with open(output_file, "w", encoding="utf-8") as f:
+                        f.write(new_text)
+                    total += hits
+                except OSError as err:
+                    self.log(f"Could not write validator output for {os.path.basename(output_file)}: {err}")
+        if total:
+            self.log(f"EU/Spain validators replaced {total} additional identifier(s).")
 
     def _populate_results(
         self,
@@ -1224,12 +1322,11 @@ class ScrubberApp:
             "Names": 0,
             "Numbers/IDs": 0,
             "Locations": 0,
+            "EU/Spain IDs": 0,
             "Other": 0,
         }
 
         for original_path, rel_txt in prepared:
-            stem = os.path.splitext(os.path.basename(rel_txt))[0]
-            rel_dir = os.path.dirname(rel_txt)
             input_full = os.path.join(temp_input_dir, rel_txt)
             try:
                 with open(input_full, encoding="utf-8", errors="replace") as f:
@@ -1237,29 +1334,7 @@ class ScrubberApp:
             except OSError:
                 continue
 
-            # The scrubber may output to output_path flat or with structure.
-            # Check both the flat location and the relative-path location.
-            flat_output = os.path.join(output_path, os.path.basename(rel_txt))
-            structured_output = os.path.join(output_path, rel_txt)
-            output_file: Optional[str] = None
-            if os.path.exists(structured_output):
-                output_file = structured_output
-            elif os.path.exists(flat_output):
-                # Scrubber wrote flat; move it to the structured location.
-                if rel_dir:
-                    ensure_dir(os.path.join(output_path, rel_dir))
-                    shutil.move(flat_output, structured_output)
-                    output_file = structured_output
-                else:
-                    output_file = flat_output
-            else:
-                # Fall back: search for any output file whose name contains the stem.
-                output_file = next(
-                    (os.path.join(output_path, n)
-                     for n in os.listdir(output_path)
-                     if stem in n),
-                    None,
-                )
+            output_file = self._resolve_output_file(output_path, rel_txt)
             if not output_file:
                 continue
             try:
@@ -1282,10 +1357,15 @@ class ScrubberApp:
         Count them by category. Surrogate-replacement output won't have these
         tokens, so the report will be empty in that mode — that's expected.
         """
-        for token in re.findall(r"\*\*([A-Z\-]+)(?:\[[^\]]*\])?\*\*", anonymized):
+        # Token charset includes "_" to match EU validator tokens like ES_DNI.
+        for token in re.findall(r"\*\*([A-Z_\-]+)(?:\[[^\]]*\])?\*\*", anonymized):
             counts["Total PHI tokens replaced"] += 1
             t = token.upper()
-            if "DATE" in t or "TIME" in t:
+            # EU/Spain validator tokens are routed first so the generic ID/SSN
+            # checks below don't claim them.
+            if t in {"ES_DNI", "ES_NIE", "ES_NIF", "IBAN", "ES_PHONE", "ES_SSN"}:
+                counts["EU/Spain IDs"] = counts.get("EU/Spain IDs", 0) + 1
+            elif "DATE" in t or "TIME" in t:
                 counts["Dates"] += 1
             elif "NAME" in t or "PATIENT" in t or "DOCTOR" in t:
                 counts["Names"] += 1
