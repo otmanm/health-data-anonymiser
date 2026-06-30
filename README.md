@@ -108,13 +108,13 @@ Three ways, easiest first:
 python3 -m unittest discover -p "test_*.py" -v
 ```
 
-86 unit tests covering the pure-logic functions: file gathering, DOCX
+96 unit tests covering the pure-logic functions: file gathering, DOCX
 extraction, PDF OCR fallback, scrubber URL discovery, OS-aware binary
 selection, config generation with detector overrides and custom
 dictionaries, settings persistence, partial-output cleanup, checksum
 verification, and the EU/Spain identifier validators (DNI/NIE/NIF/IBAN/
-phone/SSN checksum logic). tkinter is stubbed at the module level so
-tests run headless in CI.
+phone/SSN checksum logic, including grouped/spaced IBAN recovery). tkinter
+is stubbed at the module level so tests run headless in CI.
 
 GitHub Actions runs the suite on Ubuntu and macOS across Python 3.9,
 3.11, and 3.12 (see `.github/workflows/tests.yml`).

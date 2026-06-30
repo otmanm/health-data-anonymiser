@@ -22,7 +22,7 @@ import zipfile
 from urllib import request
 from urllib.error import URLError, HTTPError
 
-from validators import EU_VALIDATORS, apply_validators
+from validators import EU_TOKENS, EU_VALIDATORS, apply_validators
 
 APP_TITLE = "NLM Scrubber (macOS GUI Wrapper)"
 DEFAULT_SCRUBBER_URL = "https://lhncbc.nlm.nih.gov/scrubber/files/scrubber.19.0403L.zip"
@@ -1362,8 +1362,9 @@ class ScrubberApp:
             counts["Total PHI tokens replaced"] += 1
             t = token.upper()
             # EU/Spain validator tokens are routed first so the generic ID/SSN
-            # checks below don't claim them.
-            if t in {"ES_DNI", "ES_NIE", "ES_NIF", "IBAN", "ES_PHONE", "ES_SSN"}:
+            # checks below don't claim them. EU_TOKENS is imported from validators
+            # so this set can never drift from the tokens that module emits.
+            if t in EU_TOKENS:
                 counts["EU/Spain IDs"] = counts.get("EU/Spain IDs", 0) + 1
             elif "DATE" in t or "TIME" in t:
                 counts["Dates"] += 1

@@ -74,8 +74,12 @@ def validate_nif_cif(s: str) -> bool:
 
 # --- IBAN (pan-EU, mod-97) -------------------------------------------------
 def validate_iban(s: str) -> bool:
-    """Validate any IBAN via the ISO 7064 mod-97 check (==1)."""
-    s = re.sub(r"\s+", "", s.upper())
+    """Validate any IBAN via the ISO 7064 mod-97 check (==1).
+
+    Whitespace and hyphens (common display separators for grouped IBANs) are
+    stripped before validation; IBANs never legitimately contain either.
+    """
+    s = re.sub(r"[\s\-]", "", s.upper())
     if not re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]{10,30}", s):
         return False
     # Move the four initial characters to the end of the string.
@@ -126,7 +130,35 @@ def _make_finder(pattern: str, validator: Callable[[str], bool]) -> Callable[[st
 find_dni = _make_finder(r"\b\d{8}[A-Za-z]\b", validate_dni)
 find_nie = _make_finder(r"\b[XYZxyz]\d{7}[A-Za-z]\b", validate_nie)
 find_nif_cif = _make_finder(r"\b[A-HJNPQRSUVWa-hjnpqrsuvw]\d{7}[0-9A-Ja-j]\b", validate_nif_cif)
-find_iban = _make_finder(r"\b[A-Za-z]{2}\d{2}[A-Za-z0-9]{10,30}\b", validate_iban)
+
+
+# IBAN needs a bespoke finder: real IBANs are usually written in space-separated
+# 4-char groups ("ES91 2100 0418 4502 0005 1332"), but a permissive regex that
+# allows spaces is greedy and would swallow the following word, making the mod-97
+# check fail and the IBAN get missed. So we grab a permissive candidate, then
+# right-trim trailing tokens until validate_iban passes (or the candidate is too
+# short), reporting a span that covers exactly the real IBAN.
+_IBAN_CANDIDATE = re.compile(r"\b[A-Za-z]{2}\d{2}(?:[ \-]?[A-Za-z0-9]){11,40}")
+
+
+def find_iban(text: str) -> list:
+    spans = []
+    for m in _IBAN_CANDIDATE.finditer(text):
+        candidate = m.group(0)
+        # Drop trailing separators, then whole space/dash-delimited tokens,
+        # re-validating after each trim. Shortest valid IBAN is 15 chars.
+        while candidate:
+            trimmed = candidate.rstrip(" -")
+            if validate_iban(trimmed):
+                spans.append((m.start(), m.start() + len(trimmed), trimmed))
+                break
+            cut = max(trimmed.rfind(" "), trimmed.rfind("-"))
+            if cut == -1:
+                break
+            candidate = trimmed[:cut]
+    return spans
+
+
 # Leading separator lives inside the prefix group so a bare number doesn't
 # consume the whitespace that precedes it (e.g. "tel 612..." keeps its space).
 find_es_phone = _make_finder(r"(?:(?:\+34|0034)[\s.\-]?)?[6789]\d{2}[\s.\-]?\d{3}[\s.\-]?\d{3}\b", validate_es_phone)
@@ -152,6 +184,10 @@ _TOKEN_BY_KEY = {
     "es_phone": "ES_PHONE",
     "es_ssn": "ES_SSN",
 }
+
+# Public set of the placeholder tokens this module emits. Importers (e.g. the GUI
+# report) should use this rather than re-listing the tokens, so the two never drift.
+EU_TOKENS = frozenset(_TOKEN_BY_KEY.values())
 
 
 def apply_validators(text: str, enabled: set) -> tuple:

@@ -768,6 +768,19 @@ class TestTallyRedactions(unittest.TestCase):
         self.assertEqual(counts["Numbers/IDs"], 2)
         self.assertEqual(counts["EU/Spain IDs"], 0)
 
+    def test_every_eu_token_routes_to_eu_bucket(self):
+        # Drive the router from the same EU_TOKENS set the validators module emits,
+        # so this fails if the router and the token set ever drift apart.
+        from nlm_scrubber_mac_gui import ScrubberApp
+        from validators import EU_TOKENS
+
+        counts = self._counts()
+        text = " ".join(f"**{token}**" for token in sorted(EU_TOKENS))
+        ScrubberApp._tally_redactions(text, counts)
+        self.assertEqual(counts["EU/Spain IDs"], len(EU_TOKENS))
+        self.assertEqual(counts["Numbers/IDs"], 0)
+        self.assertEqual(counts["Total PHI tokens replaced"], len(EU_TOKENS))
+
 
 if __name__ == "__main__":
     unittest.main()

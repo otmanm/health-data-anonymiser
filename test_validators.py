@@ -10,6 +10,7 @@ Run with:  python3 -m unittest test_validators -v
 import unittest
 
 from validators import (
+    EU_TOKENS,
     EU_VALIDATORS,
     apply_validators,
     find_dni,
@@ -76,6 +77,38 @@ class TestIban(unittest.TestCase):
 
     def test_bad_format(self):
         self.assertFalse(validate_iban("1234567890"))
+
+    def test_finder_grouped_iban(self):
+        # Real IBANs are usually written in 4-char groups. The finder must catch
+        # the spaced form and report a span covering exactly the IBAN, not the
+        # trailing word. This is the regression guard for the original gap where
+        # find_iban's regex allowed no whitespace.
+        text = "Pago a ES91 2100 0418 4502 0005 1332 hoy"
+        spans = find_iban(text)
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0][2], "ES91 2100 0418 4502 0005 1332")
+        # The matched span ends right before " hoy".
+        self.assertEqual(text[spans[0][0]:spans[0][1]], "ES91 2100 0418 4502 0005 1332")
+
+    def test_finder_dash_grouped_iban(self):
+        spans = find_iban("IBAN: ES91-2100-0418-4502-0005-1332.")
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0][2], "ES91-2100-0418-4502-0005-1332")
+
+    def test_finder_compact_iban_still_found(self):
+        spans = find_iban("Transferir a ES9121000418450200051332 hoy")
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0][2], "ES9121000418450200051332")
+
+    def test_finder_grouped_one_digit_flipped_rejected(self):
+        # The mod-97 gate must still reject a grouped near-miss.
+        self.assertEqual(find_iban("Pago a ES91 2100 0418 4502 0005 1333 hoy"), [])
+
+    def test_apply_replaces_grouped_iban_as_single_token(self):
+        text = "Pago a ES91 2100 0418 4502 0005 1332 hoy"
+        out, counts = apply_validators(text, {"iban"})
+        self.assertEqual(out, "Pago a **IBAN** hoy")
+        self.assertEqual(counts["iban"], 1)
 
 
 class TestEsPhone(unittest.TestCase):
@@ -161,6 +194,43 @@ class TestApplyValidators(unittest.TestCase):
         self.assertEqual(counts["es_dni"], 2)
         self.assertNotIn("12345678Z", out)
         self.assertNotIn("11111111H", out)
+
+    def test_multiline_all_caught(self):
+        text = "DNI 12345678Z\nIBAN ES9121000418450200051332\ntel 612345678"
+        out, counts = apply_validators(text, self._all_keys())
+        self.assertEqual(out, "DNI **ES_DNI**\nIBAN **IBAN**\ntel **ES_PHONE**")
+        self.assertEqual(counts["es_dni"], 1)
+        self.assertEqual(counts["iban"], 1)
+        self.assertEqual(counts["es_phone"], 1)
+
+    def test_distinct_types_no_collision(self):
+        # A valid DNI, NIE, and NIF/CIF in one string must each map to their own
+        # token — the finders must not poach each other's matches.
+        text = "DNI 12345678Z NIE X1234567L CIF A58818501"
+        out, counts = apply_validators(text, {"es_dni", "es_nie", "es_nif"})
+        self.assertEqual(out, "DNI **ES_DNI** NIE **ES_NIE** CIF **ES_NIF**")
+        self.assertEqual(counts["es_dni"], 1)
+        self.assertEqual(counts["es_nie"], 1)
+        self.assertEqual(counts["es_nif"], 1)
+
+    def test_overlap_resolution_single_replacement(self):
+        # Two enabled finders could each match within the same region; overlap
+        # resolution must keep one span, never double-wrap.
+        text = "IBAN ES9121000418450200051332 fin"
+        out, counts = apply_validators(text, self._all_keys())
+        self.assertEqual(out.count("**IBAN**"), 1)
+        self.assertNotIn("****", out)  # no nested/double replacement
+        self.assertEqual(sum(counts.values()), 1)
+
+
+class TestEuTokens(unittest.TestCase):
+    def test_tokens_match_registry(self):
+        # EU_TOKENS must contain exactly one token per registered validator, so the
+        # GUI report router (which imports EU_TOKENS) can never drift from the
+        # tokens apply_validators actually emits.
+        self.assertEqual(len(EU_TOKENS), len(EU_VALIDATORS))
+        for token in ("ES_DNI", "ES_NIE", "ES_NIF", "IBAN", "ES_PHONE", "ES_SSN"):
+            self.assertIn(token, EU_TOKENS)
 
 
 if __name__ == "__main__":
