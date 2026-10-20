@@ -61,22 +61,12 @@ class TestNifCif(unittest.TestCase):
     def test_wrong_control(self):
         self.assertFalse(validate_nif_cif("A58818500"))
 
-    def test_digit_only_org_rejects_letter_control(self):
-        # 'A' orgs require a numeric control: A58818501 is valid, its letter form is not.
+    def test_either_control_form_accepted(self):
+        # Sources conflict per org letter, so both digit and letter forms pass.
         self.assertTrue(validate_nif_cif("A58818501"))
-        self.assertFalse(validate_nif_cif("A5881850A"))
-
-    def test_letter_only_org_rejects_digit_control(self):
-        # 'P' orgs require a letter control. Digit 5 -> letter 'E'.
-        from validators import _CIF_CONTROL_LETTERS
-        digits = "2812345"
-        total = 0
-        for i, ch in enumerate(digits):
-            n = int(ch) * (2 if i % 2 == 0 else 1)
-            total += n // 10 + n % 10
-        check = (10 - total % 10) % 10
-        self.assertTrue(validate_nif_cif("P" + digits + _CIF_CONTROL_LETTERS[check]))
-        self.assertFalse(validate_nif_cif("P" + digits + str(check)))
+        self.assertTrue(validate_nif_cif("A5881850A"))
+        self.assertTrue(validate_nif_cif("N12345674"))
+        self.assertFalse(validate_nif_cif("A58818502"))
 
     def test_bad_format(self):
         self.assertFalse(validate_nif_cif("12345678Z"))
@@ -163,6 +153,12 @@ class TestEsSsn(unittest.TestCase):
         base = int(province + number)
         control = f"{base % 97:02d}"
         self.assertTrue(validate_es_ssn(province + number + control))
+
+    def test_published_example_and_low_serial_rules(self):
+        self.assertTrue(validate_es_ssn("281234567840"))   # concatenation rule
+        self.assertFalse(validate_es_ssn("281234567841"))
+        self.assertTrue(validate_es_ssn("280123456785"))   # concatenation rule
+        self.assertTrue(validate_es_ssn("280123456742"))   # split rule
 
     def test_impossible_province_rejected(self):
         # Checksum-correct but province 99 does not exist.

@@ -44,8 +44,6 @@ def validate_nie(s: str) -> bool:
 _CIF_ORG_LETTERS = "ABCDEFGHJNPQRSUVW"
 # For CIFs whose control char is a letter, this string maps the digit to it.
 _CIF_CONTROL_LETTERS = "JABCDEFGHI"
-_CIF_LETTER_ONLY = frozenset("NPQRSW")
-_CIF_DIGIT_ONLY = frozenset("ABEH")
 
 
 def validate_nif_cif(s: str) -> bool:
@@ -67,10 +65,11 @@ def validate_nif_cif(s: str) -> bool:
         total += n
     check_digit = (10 - (total % 10)) % 10
     check_letter = _CIF_CONTROL_LETTERS[check_digit]
-    # Org types N/P/Q/R/S/W require a letter control, A/B/E/H require a digit,
-    # and the remaining types accept either.
-    if org in _CIF_LETTER_ONLY:
-        return control == check_letter
+    # Sources conflict on which org letters take a digit vs a letter control, so
+    # (like python-stdnum) accept either form for every org letter.
+    if control.isdigit():
+        return int(control) == check_digit
+    return control == check_letter
     if org in _CIF_DIGIT_ONLY:
         return control.isdigit() and int(control) == check_digit
     if control.isdigit():
@@ -117,8 +116,13 @@ def validate_es_phone(s: str) -> bool:
 
 # --- Spanish social-security number ----------------------------------------
 def validate_es_ssn(s: str) -> bool:
-    """Spanish SSN: 2-digit province + 8-digit number + 2-digit control,
-    validated as ``control == (province*10^7 + number) mod 97``."""
+    """Spanish SSN (NAF): 2-digit province + 8-digit serial + 2 control digits.
+
+    Published implementations disagree for serials below 10,000,000 (numbers
+    issued before 1992): some use ``int(province + serial) % 97``, others
+    ``(province * 10**7 + serial) % 97``. No official algorithm was found, so
+    accept either; this favours redacting over missing an identifier.
+    """
     digits = re.sub(r"[\s/\-]", "", s)
     if not re.fullmatch(r"\d{12}", digits):
         return False
@@ -126,8 +130,9 @@ def validate_es_ssn(s: str) -> bool:
     # Valid provinces are 01-53 (plus 66 for residents abroad); serial can't be zero.
     if not (1 <= int(province) <= 53 or province == "66") or int(number) == 0:
         return False
-    base = int(province + number)
-    return base % 97 == int(control)
+    concat = int(province + number) % 97
+    split = (int(province) * 10**7 + int(number)) % 97
+    return int(control) in (concat, split)
 
 
 # --- Finders: locate candidates, keep only checksum-valid ones -------------

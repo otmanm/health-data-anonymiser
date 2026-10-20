@@ -6,6 +6,30 @@ This repo is my first public artifact in healthcare data privacy: a local macOS 
 
 It is not a medical device, not a compliance guarantee, and not a replacement for expert privacy review.
 
+## Status: frozen prototype
+
+This repo is frozen as a prototype. It is not under active development and is
+not suitable as a privacy control for real patient data.
+
+For maintained, local-first healthcare de-identification, see
+[OpenMed](https://github.com/maziyarpanahi/openmed). It is a separate, larger
+project that I contribute to but do not own, and it already includes
+checksum-validated Spanish DNI/NIE and IBAN handling.
+
+Known limitations of this prototype:
+
+- **Never run against the real NLM Scrubber on a Mac.** The generated config
+  keys and the assumed output format (`**TOKEN**` and `[TOKEN]` markers) are
+  unverified against NLM's documentation, so the diff/report features may not
+  match real output.
+- **Some options are not documented NLM features** (surrogate replacement,
+  per-detector toggles) and may have no effect.
+- **The Spanish validators have gaps:** personal NIFs starting with K, L or M
+  and hyphenated/dotted DNI forms are not recognized. The social security
+  (NAF) check accepts two published variants because no official algorithm
+  was found, and CIF-shaped strings match by chance at a noticeable rate.
+- **AI-assisted code with no expert review.**
+
 ## Project intent
 
 The original idea was broader than a single local tool.
