@@ -59,6 +59,7 @@ EOF
 
 echo "Running NLM Scrubber via Docker..."
 docker run --rm \
+    --platform linux/amd64 \
     -v "${SCRUBBER_DIR}:/scrubber" \
     -v "${INPUT}:/input:ro" \
     -v "${OUTPUT}:/output" \

@@ -434,6 +434,36 @@ def extract_text_from_pdf_ocr(path: str, log_cb: Callable[[str], None]) -> Optio
         return "\n".join(texts) if texts else None
 
 
+def _ocr_pdf_pages(
+    path: str, pages: list[int], log_cb: Callable[[str], None]
+) -> Optional[dict[int, str]]:
+    """OCR only the given 1-based *pages* of a PDF. None if the tools are missing."""
+    for tool in ("pdftoppm", "tesseract"):
+        if shutil.which(tool) is None:
+            log_cb(f"OCR unavailable: {tool} not found. Install with: brew install poppler tesseract")
+            return None
+    results: dict[int, str] = {}
+    with tempfile.TemporaryDirectory(prefix="nlm_ocr_") as tmp:
+        for n in pages:
+            prefix = os.path.join(tmp, f"p{n}")
+            try:
+                subprocess.run(
+                    ["pdftoppm", "-r", "300", "-png", "-f", str(n), "-l", str(n), path, prefix],
+                    check=True, capture_output=True, timeout=300,
+                )
+                images = sorted(f for f in os.listdir(tmp) if f.startswith(f"p{n}-") and f.endswith(".png"))
+                if not images:
+                    continue
+                out = subprocess.run(
+                    ["tesseract", os.path.join(tmp, images[0]), "-", "-l", "eng"],
+                    check=True, capture_output=True, text=True, timeout=120,
+                )
+                results[n] = out.stdout
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
+                log_cb(f"OCR failed on page {n}: {err}")
+    return results
+
+
 def extract_text_from_pdf(path: str, log_cb: Callable[[str], None]) -> Optional[str]:
     """Plain text from a PDF using `pdftotext` (poppler).
 
@@ -470,6 +500,26 @@ def extract_text_from_pdf(path: str, log_cb: Callable[[str], None]) -> Optional[
             log_cb(f"OCR extracted {len(ocr_text):,} characters from {os.path.basename(path)}.")
             return ocr_text
         return None
+
+    # Mixed PDFs: some pages have a text layer, others are scans. pdftotext
+    # separates pages with form feeds; OCR the blank ones so they don't vanish.
+    pages = text.split("\f")
+    if pages and pages[-1] == "":
+        pages.pop()
+    blank = [i + 1 for i, pg in enumerate(pages) if not pg.strip()]
+    if blank:
+        name = os.path.basename(path)
+        log_cb(f"PDF {name}: page(s) {blank} have no text layer; attempting OCR on them...")
+        ocr = _ocr_pdf_pages(path, blank, log_cb)
+        missing = [n for n in blank if not (ocr or {}).get(n, "").strip()]
+        for n, page_text in (ocr or {}).items():
+            pages[n - 1] = page_text
+        if missing:
+            log_cb(
+                f"WARNING: no text recovered for page(s) {missing} of {name}; "
+                "they will be missing from the output. Review the original."
+            )
+        return "\n".join(pages)
     return text
 
 
@@ -1373,7 +1423,9 @@ class ScrubberApp:
         tokens, so the report will be empty in that mode — that's expected.
         """
         # Token charset includes "_" to match EU validator tokens like ES_DNI.
-        for token in re.findall(r"\*\*([A-Z_\-]+)(?:\[[^\]]*\])?\*\*", anonymized):
+        # Also accept NLM's bracketed style, e.g. [PERSONALNAME] / [PII].
+        for m in re.finditer(r"\*\*([A-Z_\-]+)(?:\[[^\]]*\])?\*\*|\[([A-Z][A-Z_]{2,})\]", anonymized):
+            token = m.group(1) or m.group(2)
             counts["Total PHI tokens replaced"] += 1
             t = token.upper()
             # EU/Spain validator tokens are routed first so the generic ID/SSN

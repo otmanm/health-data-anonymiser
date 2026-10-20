@@ -624,6 +624,35 @@ class TestPdfOcrFallback(unittest.TestCase):
         mock_ocr.assert_not_called()
         mock_run.assert_called_once()
 
+    def test_mixed_pdf_ocrs_only_blank_pages(self):
+        log_cb = MagicMock()
+        # Page 1 has text, page 2 is a scan (blank), page 3 has text; trailing \f.
+        pdftotext_out = "page one\f \fpage three\f"
+        with patch(
+            "nlm_scrubber_mac_gui.subprocess.run",
+            return_value=self._completed(stdout=pdftotext_out),
+        ), patch(
+            "nlm_scrubber_mac_gui._ocr_pdf_pages", return_value={2: "scanned text"}
+        ) as mock_pages, patch(
+            "nlm_scrubber_mac_gui.extract_text_from_pdf_ocr"
+        ) as mock_whole:
+            result = extract_text_from_pdf("/fake.pdf", log_cb)
+        mock_pages.assert_called_once_with("/fake.pdf", [2], log_cb)
+        mock_whole.assert_not_called()
+        self.assertEqual(result.split("\n"), ["page one", "scanned text", "page three"])
+
+    def test_mixed_pdf_warns_when_ocr_unavailable(self):
+        log_cb = MagicMock()
+        with patch(
+            "nlm_scrubber_mac_gui.subprocess.run",
+            return_value=self._completed(stdout="text\f\f"),
+        ), patch("nlm_scrubber_mac_gui._ocr_pdf_pages", return_value=None):
+            result = extract_text_from_pdf("/fake.pdf", log_cb)
+        self.assertIn("text", result)
+        warnings = [c.args[0] for c in log_cb.call_args_list if "WARNING" in c.args[0]]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("[2]", warnings[0])
+
     def test_pdf_with_empty_text_triggers_ocr(self):
         log_cb = MagicMock()
         with patch(
@@ -768,6 +797,16 @@ class TestTallyRedactions(unittest.TestCase):
         self.assertEqual(counts["Numbers/IDs"], 2)
         self.assertEqual(counts["EU/Spain IDs"], 0)
 
+    def test_bracketed_nlm_markers_counted(self):
+        from nlm_scrubber_mac_gui import ScrubberApp
+        counts = self._counts()
+        ScrubberApp._tally_redactions(
+            "[PERSONALNAME] saw [PII] on [DATE]; see [note] and [OK]", counts
+        )
+        self.assertEqual(counts["Total PHI tokens replaced"], 3)
+        self.assertEqual(counts["Names"], 1)
+        self.assertEqual(counts["Dates"], 1)
+
     def test_every_eu_token_routes_to_eu_bucket(self):
         # Drive the router from the same EU_TOKENS set the validators module emits,
         # so this fails if the router and the token set ever drift apart.
@@ -780,6 +819,13 @@ class TestTallyRedactions(unittest.TestCase):
         self.assertEqual(counts["EU/Spain IDs"], len(EU_TOKENS))
         self.assertEqual(counts["Numbers/IDs"], 0)
         self.assertEqual(counts["Total PHI tokens replaced"], len(EU_TOKENS))
+
+
+class TestDockerScript(unittest.TestCase):
+    def test_standalone_launcher_forces_amd64(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "run_in_docker.sh"), encoding="utf-8") as f:
+            self.assertIn("--platform linux/amd64", f.read())
 
 
 if __name__ == "__main__":
