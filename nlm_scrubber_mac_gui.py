@@ -18,6 +18,7 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, Optional
+import xml.etree.ElementTree as ET
 import zipfile
 from urllib import request
 from urllib.error import URLError, HTTPError
@@ -377,7 +378,6 @@ _DOCX_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 def extract_text_from_docx(path: str) -> str:
     """Plain text from a .docx file using only stdlib (zipfile + ElementTree)."""
-    import xml.etree.ElementTree as ET
 
     with zipfile.ZipFile(path, "r") as z:
         with z.open("word/document.xml") as f:
@@ -532,7 +532,7 @@ def extract_text(path: str, log_cb: Callable[[str], None]) -> Optional[str]:
     if ext == ".docx":
         try:
             return extract_text_from_docx(path)
-        except (zipfile.BadZipFile, KeyError) as err:
+        except (zipfile.BadZipFile, KeyError, ET.ParseError) as err:
             log_cb(f"Could not read DOCX {os.path.basename(path)}: {err}")
             return None
     if ext == ".pdf":

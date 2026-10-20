@@ -113,6 +113,9 @@ def validate_es_ssn(s: str) -> bool:
     if not re.fullmatch(r"\d{12}", digits):
         return False
     province, number, control = digits[:2], digits[2:10], digits[10:]
+    # Valid provinces are 01-53 (plus 66 for residents abroad); serial can't be zero.
+    if not (1 <= int(province) <= 53 or province == "66") or int(number) == 0:
+        return False
     base = int(province + number)
     return base % 97 == int(control)
 

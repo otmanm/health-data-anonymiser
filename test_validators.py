@@ -160,6 +160,14 @@ class TestEsSsn(unittest.TestCase):
         control = f"{base % 97:02d}"
         self.assertTrue(validate_es_ssn(province + number + control))
 
+    def test_impossible_province_rejected(self):
+        # Checksum-correct but province 99 does not exist.
+        base = int("99" + "12345678")
+        self.assertFalse(validate_es_ssn("9912345678" + f"{base % 97:02d}"))
+
+    def test_zero_serial_rejected(self):
+        self.assertFalse(validate_es_ssn("28" + "00000000" + "00"))
+
     def test_wrong_control(self):
         province, number = "28", "12345678"
         base = int(province + number)

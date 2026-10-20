@@ -28,12 +28,12 @@ OUTPUT=$(realpath "$2")
 mkdir -p "$OUTPUT"
 
 # If input is a file, wrap it in a temp dir.
-CLEANUP_INPUT=0
 if [[ -f "$INPUT" ]]; then
     TMP_INPUT=$(mktemp -d)
+    # Remove the copied health data on every exit path (success, failure, Ctrl-C).
+    trap 'rm -rf "$TMP_INPUT"' EXIT
     cp "$INPUT" "$TMP_INPUT/"
     INPUT="$TMP_INPUT"
-    CLEANUP_INPUT=1
 fi
 
 # Write a config for the container-internal paths.
@@ -67,7 +67,3 @@ docker run --rm \
     /scrubber/scrubber.lnx /scrubber/config_docker.txt
 
 echo "Done. Output: $OUTPUT"
-
-if [[ $CLEANUP_INPUT -eq 1 ]]; then
-    rm -rf "$TMP_INPUT"
-fi

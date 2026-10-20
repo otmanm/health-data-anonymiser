@@ -762,6 +762,19 @@ class TestPartialOutputCleanup(unittest.TestCase):
         self.assertEqual(m.ScrubberApp._cleanup_partial_output("/nonexistent/path", set()), 0)
 
 
+class TestMalformedDocx(unittest.TestCase):
+    def test_malformed_document_xml_returns_none(self):
+        import zipfile
+        from nlm_scrubber_mac_gui import extract_text
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "bad.docx")
+            with zipfile.ZipFile(path, "w") as z:
+                z.writestr("word/document.xml", "<w:document><unclosed>")
+            log = MagicMock()
+            self.assertIsNone(extract_text(path, log))
+            log.assert_called_once()
+
+
 class TestTallyRedactions(unittest.TestCase):
     """_tally_redactions routes token categories, including EU/Spain validator
     tokens which must land in their own bucket, not Numbers/IDs.
@@ -822,6 +835,11 @@ class TestTallyRedactions(unittest.TestCase):
 
 
 class TestDockerScript(unittest.TestCase):
+    def test_standalone_launcher_cleans_temp_input_on_exit(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "run_in_docker.sh"), encoding="utf-8") as f:
+            self.assertIn("trap 'rm -rf \"$TMP_INPUT\"' EXIT", f.read())
+
     def test_standalone_launcher_forces_amd64(self):
         here = os.path.dirname(os.path.abspath(__file__))
         with open(os.path.join(here, "run_in_docker.sh"), encoding="utf-8") as f:
