@@ -183,6 +183,8 @@ def run_with_docker(
     bin_name = os.path.basename(binary)
     cmd = [
         "docker", "run", "--rm",
+        # The NLM Linux binary is x86_64-only; without this Apple Silicon pulls arm64.
+        "--platform", "linux/amd64",
         "-v", f"{SCRUBBER_DIR}:/scrubber",
         "-v", f"{input_dir}:/input:ro",
         "-v", f"{output_dir}:/output",
@@ -552,6 +554,7 @@ class ScrubberApp:
         self._redaction_counts: dict[str, int] = {}
         self._custom_terms: str = ""
         self._enabled_eu: set[str] = set()
+        self._use_docker = False
         self._log_file_handle: Optional[object] = None
         self._log_output_dir: str = ""
 
@@ -921,6 +924,7 @@ class ScrubberApp:
         # Tk variables must be read on the main thread; snapshot the enabled
         # EU validators here and hand the set to the worker thread.
         self._enabled_eu = {key for key, var in self.eu_vars.items() if var.get()}
+        self._use_docker = self.use_docker.get()
         self._custom_terms = ""
         if hasattr(self, "custom_terms_text"):
             self._custom_terms = self.custom_terms_text.get("1.0", "end").strip()
@@ -1166,38 +1170,49 @@ class ScrubberApp:
             pre_existing_output = self._snapshot_dir(output_path)
 
             process: Optional[subprocess.Popen] = None
-            try:
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    cwd=SCRUBBER_DIR,
+            if self._use_docker:
+                self.log("Run via Docker is enabled — skipping the native binary.")
+                process = run_with_docker(
+                    binary, CONFIG_FILE, temp_input_dir, output_path,
+                    self.log, self.cancel_event,
                 )
-            except FileNotFoundError:
-                self._finish(False, "Scrubber binary not found.")
-                return
-            except OSError as err:
-                if "Exec format" in str(err) or getattr(err, "errno", None) == 8:
-                    self.log("Native binary cannot run on this OS — trying Docker fallback...")
-                    process = run_with_docker(
-                        binary, CONFIG_FILE, temp_input_dir, output_path,
-                        self.log, self.cancel_event,
+                if process is None:
+                    self._finish(False, "Docker was requested but could not be started. "
+                                        "Is Docker running?")
+                    return
+            if process is None:
+                try:
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        cwd=SCRUBBER_DIR,
                     )
-                    if process is None:
-                        self._finish(
-                            False,
-                            f"Scrubber binary is not executable on this OS "
-                            f"({platform.system()}) and Docker fallback failed. "
-                            "Install Docker Desktop or run on Linux.",
+                except FileNotFoundError:
+                    self._finish(False, "Scrubber binary not found.")
+                    return
+                except OSError as err:
+                    if "Exec format" in str(err) or getattr(err, "errno", None) == 8:
+                        self.log("Native binary cannot run on this OS — trying Docker fallback...")
+                        process = run_with_docker(
+                            binary, CONFIG_FILE, temp_input_dir, output_path,
+                            self.log, self.cancel_event,
                         )
+                        if process is None:
+                            self._finish(
+                                False,
+                                f"Scrubber binary is not executable on this OS "
+                                f"({platform.system()}) and Docker fallback failed. "
+                                "Install Docker Desktop or run on Linux.",
+                            )
+                            return
+                    else:
+                        self._finish(False, f"Error running scrubber: {err}")
                         return
-                else:
+                except Exception as err:
                     self._finish(False, f"Error running scrubber: {err}")
                     return
-            except Exception as err:
-                self._finish(False, f"Error running scrubber: {err}")
-                return
 
             stop_watcher = threading.Event()
             watcher = threading.Thread(

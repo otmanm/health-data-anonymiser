@@ -61,6 +61,23 @@ class TestNifCif(unittest.TestCase):
     def test_wrong_control(self):
         self.assertFalse(validate_nif_cif("A58818500"))
 
+    def test_digit_only_org_rejects_letter_control(self):
+        # 'A' orgs require a numeric control: A58818501 is valid, its letter form is not.
+        self.assertTrue(validate_nif_cif("A58818501"))
+        self.assertFalse(validate_nif_cif("A5881850A"))
+
+    def test_letter_only_org_rejects_digit_control(self):
+        # 'P' orgs require a letter control. Digit 5 -> letter 'E'.
+        from validators import _CIF_CONTROL_LETTERS
+        digits = "2812345"
+        total = 0
+        for i, ch in enumerate(digits):
+            n = int(ch) * (2 if i % 2 == 0 else 1)
+            total += n // 10 + n % 10
+        check = (10 - total % 10) % 10
+        self.assertTrue(validate_nif_cif("P" + digits + _CIF_CONTROL_LETTERS[check]))
+        self.assertFalse(validate_nif_cif("P" + digits + str(check)))
+
     def test_bad_format(self):
         self.assertFalse(validate_nif_cif("12345678Z"))
 
@@ -123,6 +140,16 @@ class TestEsPhone(unittest.TestCase):
 
     def test_too_short(self):
         self.assertFalse(validate_es_phone("61234567"))
+
+    def test_finder_common_groupings(self):
+        from validators import find_es_phone
+        for number in ("+34 91 123 45 67", "612 34 56 78", "612345678", "+34 612 345 678"):
+            spans = find_es_phone(f"tel {number} ok")
+            self.assertEqual([sp[2] for sp in spans], [number], number)
+
+    def test_finder_ignores_longer_digit_runs(self):
+        from validators import find_es_phone
+        self.assertEqual(find_es_phone("ref 6123456789"), [])
 
 
 class TestEsSsn(unittest.TestCase):

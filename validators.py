@@ -44,6 +44,8 @@ def validate_nie(s: str) -> bool:
 _CIF_ORG_LETTERS = "ABCDEFGHJNPQRSUVW"
 # For CIFs whose control char is a letter, this string maps the digit to it.
 _CIF_CONTROL_LETTERS = "JABCDEFGHI"
+_CIF_LETTER_ONLY = frozenset("NPQRSW")
+_CIF_DIGIT_ONLY = frozenset("ABEH")
 
 
 def validate_nif_cif(s: str) -> bool:
@@ -65,8 +67,12 @@ def validate_nif_cif(s: str) -> bool:
         total += n
     check_digit = (10 - (total % 10)) % 10
     check_letter = _CIF_CONTROL_LETTERS[check_digit]
-    # Some org types require a digit control, some a letter; P/Q/S/N/W and a few
-    # accept either. We accept if it matches the computed digit OR letter.
+    # Org types N/P/Q/R/S/W require a letter control, A/B/E/H require a digit,
+    # and the remaining types accept either.
+    if org in _CIF_LETTER_ONLY:
+        return control == check_letter
+    if org in _CIF_DIGIT_ONLY:
+        return control.isdigit() and int(control) == check_digit
     if control.isdigit():
         return int(control) == check_digit
     return control == check_letter
@@ -161,7 +167,9 @@ def find_iban(text: str) -> list:
 
 # Leading separator lives inside the prefix group so a bare number doesn't
 # consume the whitespace that precedes it (e.g. "tel 612..." keeps its space).
-find_es_phone = _make_finder(r"(?:(?:\+34|0034)[\s.\-]?)?[6789]\d{2}[\s.\-]?\d{3}[\s.\-]?\d{3}\b", validate_es_phone)
+# Digit grouping is left permissive (3-3-3, 2-3-2-2, ...); validate_es_phone
+# enforces the nine-digit structure.
+find_es_phone = _make_finder(r"(?<!\d)(?:(?:\+34|0034)[\s.\-]?)?[6789]\d(?:[\s.\-]?\d){7}(?!\d)", validate_es_phone)
 find_es_ssn = _make_finder(r"\b\d{2}[\s/\-]?\d{8}[\s/\-]?\d{2}\b", validate_es_ssn)
 
 
