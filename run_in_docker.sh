@@ -24,8 +24,8 @@ if [[ $# -lt 2 ]]; then
 fi
 
 INPUT=$(realpath "$1")
+mkdir -p "$2"
 OUTPUT=$(realpath "$2")
-mkdir -p "$OUTPUT"
 
 # If input is a file, wrap it in a temp dir.
 if [[ -f "$INPUT" ]]; then

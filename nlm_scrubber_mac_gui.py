@@ -614,6 +614,7 @@ class ScrubberApp:
         self._custom_terms: str = ""
         self._enabled_eu: set[str] = set()
         self._use_docker = False
+        self._pre_existing_output: set[str] = set()
         self._log_file_handle: Optional[object] = None
         self._log_output_dir: str = ""
 
@@ -1227,6 +1228,7 @@ class ScrubberApp:
             # Snapshot output dir so we can clean up files we wrote if cancelled,
             # without touching files the user already had there.
             pre_existing_output = self._snapshot_dir(output_path)
+            self._pre_existing_output = pre_existing_output
 
             process: Optional[subprocess.Popen] = None
             if self._use_docker:
@@ -1312,13 +1314,17 @@ class ScrubberApp:
                 shutil.rmtree(temp_input_dir, ignore_errors=True)
 
     @staticmethod
-    def _resolve_output_file(output_path: str, rel_txt: str) -> Optional[str]:
+    def _resolve_output_file(
+        output_path: str, rel_txt: str, pre_existing: Optional[set] = None
+    ) -> Optional[str]:
         """Locate the scrubber's output file for a given prepared input.
 
         The scrubber may write output flat or with the input's subdirectory
         structure, and may vary the filename slightly. Checks the structured
         location, then the flat location (moving it into place to preserve
-        structure), then falls back to a stem-name search.
+        structure), then falls back to a stem-name search. The fallback never
+        returns a file that was already in the output folder before this run
+        (*pre_existing*), so unrelated files can't be mistaken for results.
         """
         stem = os.path.splitext(os.path.basename(rel_txt))[0]
         rel_dir = os.path.dirname(rel_txt)
@@ -1336,7 +1342,7 @@ class ScrubberApp:
             return next(
                 (os.path.join(output_path, n)
                  for n in os.listdir(output_path)
-                 if stem in n),
+                 if stem in n and n not in (pre_existing or ())),
                 None,
             )
         except OSError:
@@ -1356,7 +1362,7 @@ class ScrubberApp:
         """
         total = 0
         for _original_path, rel_txt in prepared:
-            output_file = self._resolve_output_file(output_path, rel_txt)
+            output_file = self._resolve_output_file(output_path, rel_txt, self._pre_existing_output)
             if not output_file:
                 continue
             try:
@@ -1408,7 +1414,7 @@ class ScrubberApp:
             except OSError:
                 continue
 
-            output_file = self._resolve_output_file(output_path, rel_txt)
+            output_file = self._resolve_output_file(output_path, rel_txt, self._pre_existing_output)
             if not output_file:
                 continue
             try:

@@ -776,6 +776,25 @@ class TestDocxBreaks(unittest.TestCase):
             self.assertEqual(extract_text_from_docx(path), "12345678Z\nDiagnosis\tx")
 
 
+class TestResolveOutputFallback(unittest.TestCase):
+    def test_fallback_ignores_preexisting_unrelated_file(self):
+        from nlm_scrubber_mac_gui import ScrubberApp
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "case_old.txt"), "w").close()
+            self.assertIsNone(
+                ScrubberApp._resolve_output_file(d, "case.txt", {"case_old.txt"})
+            )
+
+    def test_fallback_still_finds_new_renamed_output(self):
+        from nlm_scrubber_mac_gui import ScrubberApp
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "case_scrubbed.txt"), "w").close()
+            self.assertEqual(
+                ScrubberApp._resolve_output_file(d, "case.txt", set()),
+                os.path.join(d, "case_scrubbed.txt"),
+            )
+
+
 class TestGatherSkipsRunLogs(unittest.TestCase):
     def test_run_logs_not_gathered(self):
         from nlm_scrubber_mac_gui import gather_files
