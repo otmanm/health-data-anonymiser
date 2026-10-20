@@ -18,10 +18,14 @@ checksum-validated Spanish DNI/NIE and IBAN handling.
 
 Known limitations of this prototype:
 
-- **Never run against the real NLM Scrubber on a Mac.** The generated config
-  keys and the assumed output format (`**TOKEN**` and `[TOKEN]` markers) are
-  unverified against NLM's documentation, so the diff/report features may not
-  match real output.
+- **Probably does not work end to end yet.** It has never been run against the
+  real NLM Scrubber. Two independent reviews found that the config file it
+  writes uses key names NLM does not document (NLM expects `ClinicalReports_dir`,
+  `ClinicalReports_files`, `nPHI_outdir`), that the built-in download URL may
+  be outdated (403), and that NLM's output tags (`[PERSONALNAME]`-style) may not
+  match what the diff/report code expects. Treat the NLM integration as unproven.
+- **A run can report success with missing results** if the scrubber omits a
+  file; check that every input has an output.
 - **Some options are not documented NLM features** (surrogate replacement,
   per-detector toggles) and may have no effect.
 - **The Spanish validators have gaps:** personal NIFs starting with K, L or M

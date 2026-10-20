@@ -539,7 +539,7 @@ def extract_text(path: str, log_cb: Callable[[str], None]) -> Optional[str]:
     if ext == ".docx":
         try:
             return extract_text_from_docx(path)
-        except (zipfile.BadZipFile, KeyError, ET.ParseError) as err:
+        except (zipfile.BadZipFile, KeyError, ET.ParseError, OSError) as err:
             log_cb(f"Could not read DOCX {os.path.basename(path)}: {err}")
             return None
     if ext == ".pdf":
