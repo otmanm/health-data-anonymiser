@@ -108,7 +108,7 @@ Three ways, easiest first:
 python3 -m unittest discover -p "test_*.py" -v
 ```
 
-108 unit tests covering the pure-logic functions: file gathering, DOCX
+111 unit tests covering the pure-logic functions: file gathering, DOCX
 extraction, PDF OCR fallback, scrubber URL discovery, OS-aware binary
 selection, config generation with detector overrides and custom
 dictionaries, settings persistence, partial-output cleanup, checksum

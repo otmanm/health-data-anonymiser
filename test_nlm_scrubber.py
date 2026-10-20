@@ -762,6 +762,29 @@ class TestPartialOutputCleanup(unittest.TestCase):
         self.assertEqual(m.ScrubberApp._cleanup_partial_output("/nonexistent/path", set()), 0)
 
 
+class TestDocxBreaks(unittest.TestCase):
+    def test_line_break_and_tab_preserved(self):
+        import zipfile
+        from nlm_scrubber_mac_gui import extract_text_from_docx
+        ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        xml = (f'<w:document xmlns:w="{ns}"><w:body><w:p><w:r><w:t>12345678Z</w:t></w:r>'
+               '<w:r><w:br/></w:r><w:r><w:t>Diagnosis</w:t><w:tab/><w:t>x</w:t></w:r></w:p></w:body></w:document>')
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.docx")
+            with zipfile.ZipFile(path, "w") as z:
+                z.writestr("word/document.xml", xml)
+            self.assertEqual(extract_text_from_docx(path), "12345678Z\nDiagnosis\tx")
+
+
+class TestGatherSkipsRunLogs(unittest.TestCase):
+    def test_run_logs_not_gathered(self):
+        from nlm_scrubber_mac_gui import gather_files
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("note.txt", "scrubber_log_20260101_000000.txt"):
+                open(os.path.join(d, name), "w").close()
+            self.assertEqual([os.path.basename(f) for f in gather_files(d)], ["note.txt"])
+
+
 class TestMalformedDocx(unittest.TestCase):
     def test_malformed_document_xml_returns_none(self):
         import zipfile

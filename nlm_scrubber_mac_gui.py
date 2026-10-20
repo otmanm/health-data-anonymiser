@@ -384,7 +384,14 @@ def extract_text_from_docx(path: str) -> str:
             tree = ET.parse(f)
     paragraphs: list[str] = []
     for para in tree.iter(f"{_DOCX_NS}p"):
-        runs = [t.text or "" for t in para.iter(f"{_DOCX_NS}t")]
+        runs: list[str] = []
+        for el in para.iter():
+            if el.tag == f"{_DOCX_NS}t":
+                runs.append(el.text or "")
+            elif el.tag in (f"{_DOCX_NS}br", f"{_DOCX_NS}cr"):
+                runs.append("\n")
+            elif el.tag == f"{_DOCX_NS}tab":
+                runs.append("\t")
         paragraphs.append("".join(runs))
     return "\n".join(paragraphs)
 
@@ -547,6 +554,8 @@ def gather_files(input_path: str) -> list[str]:
     for root, _, filenames in os.walk(input_path):
         for name in filenames:
             full = os.path.join(root, name)
+            if name.startswith("scrubber_log_"):
+                continue  # this app's own run logs, not clinical input
             if is_supported_file(full):
                 files.append(full)
     return files
@@ -952,6 +961,14 @@ class ScrubberApp:
         ensure_dir(output_path)
         self._save_settings()
 
+        files = gather_files(input_path)
+        if not files:
+            messagebox.showerror(
+                APP_TITLE,
+                "No supported files found. Accepted: .txt, .md, .pdf, .docx",
+            )
+            return
+
         if self.log_to_file.get() and output_path:
             ts = time.strftime("%Y%m%d_%H%M%S")
             log_path = os.path.join(output_path, f"scrubber_log_{ts}.txt")
@@ -961,14 +978,6 @@ class ScrubberApp:
                 self._log_file_handle = None
         else:
             self._log_file_handle = None
-
-        files = gather_files(input_path)
-        if not files:
-            messagebox.showerror(
-                APP_TITLE,
-                "No supported files found. Accepted: .txt, .md, .pdf, .docx",
-            )
-            return
 
         detector_overrides = {key: var.get() for key, var in self.phi_vars.items()}
         # Tk variables must be read on the main thread; snapshot the enabled

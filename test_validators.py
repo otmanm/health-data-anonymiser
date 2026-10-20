@@ -95,6 +95,10 @@ class TestIban(unittest.TestCase):
     def test_bad_format(self):
         self.assertFalse(validate_iban("1234567890"))
 
+    def test_wrong_length_for_country_rejected(self):
+        # Passes mod-97 but Spanish IBANs are always 24 characters.
+        self.assertFalse(validate_iban("ES9712345678901"))
+
     def test_finder_grouped_iban(self):
         # Real IBANs are usually written in 4-char groups. The finder must catch
         # the spaced form and report a span covering exactly the IBAN, not the

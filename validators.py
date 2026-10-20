@@ -79,6 +79,13 @@ def validate_nif_cif(s: str) -> bool:
 
 
 # --- IBAN (pan-EU, mod-97) -------------------------------------------------
+# Mandated IBAN lengths for common countries; others fall back to the generic check.
+_IBAN_LENGTHS = {
+    "ES": 24, "FR": 27, "DE": 22, "IT": 27, "PT": 25, "BE": 16,
+    "NL": 18, "GB": 22, "CH": 21, "IE": 22, "LU": 20, "AT": 20,
+}
+
+
 def validate_iban(s: str) -> bool:
     """Validate any IBAN via the ISO 7064 mod-97 check (==1).
 
@@ -87,6 +94,9 @@ def validate_iban(s: str) -> bool:
     """
     s = re.sub(r"[\s\-]", "", s.upper())
     if not re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]{10,30}", s):
+        return False
+    expected = _IBAN_LENGTHS.get(s[:2])
+    if expected is not None and len(s) != expected:
         return False
     # Move the four initial characters to the end of the string.
     rearranged = s[4:] + s[:4]
