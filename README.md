@@ -28,6 +28,10 @@ Known limitations of this prototype:
   and hyphenated/dotted DNI forms are not recognized. The social security
   (NAF) check accepts two published variants because no official algorithm
   was found, and CIF-shaped strings match by chance at a noticeable rate.
+- **Output is written straight into the chosen folder.** A file there with the
+  same name as a result can be overwritten, and cancelling mid-run can leave
+  partial or damaged output. Use an empty output folder.
+- **Cancelling during OCR is slow:** each page finishes before the run stops.
 - **AI-assisted code with no expert review.**
 
 ## Project intent
