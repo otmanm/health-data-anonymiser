@@ -39,3 +39,9 @@ Tired of permission prompts and wants minimal approvals. Do **not** use the Para
 
 ## Skills
 None required. `code-review` or `verify` could help if code changes resume.
+
+## Update (latest, head after this commit)
+- PR #4 head moved past b22814f: `aad2077` added a DOCX OSError fix and a stronger README warning that the NLM integration is probably non-working. CI green. Codex has now reviewed 9 times; it always finds more edge cases. Do not keep chasing them.
+- Codex rounds 8-9 also confirmed (independently of the Opus recheck): the app writes the wrong NLM config keys and its built-in download URL may be a 403 (official: https://data.lhncbc.nlm.nih.gov/public/scrubber/files/linux/scrubber.19.0403L.zip). **First real task: run the real NLM Scrubber on this Mac and fix or document the mismatch.**
+- Known, unfixed, minor: OCR can drop a failed page silently; a run can report success when the scrubber omits a file; dropped file paths with spaces may fail; phone check can cut digits from longer grouped IDs; cancel lags while the scrubber is quiet.
+- Cloud credit ($250 promo) is only for cloud sessions and expires Nov 4; local sessions use normal plan limits instead.
