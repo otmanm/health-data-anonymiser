@@ -1,5 +1,7 @@
 # Handoff: health-data-anonymiser (frozen prototype, PR #4 open)
 
+**Direction (user's latest word): this repo is effectively dead. The user's real focus is contributing to OpenMed (maziyarpanahi/openmed). Use this repo only as a source of the Spanish checksum logic (NAF, K/L/M NIF, optional CIF) for an issue-first OpenMed contribution. Do not keep building or chasing review-bot findings here.**
+
 ## Where things stand
 - Repo `otmanm/health-data-anonymiser`, branch `claude/improve-mac-gui-scrubber-SjgtZ`, **PR #4** into `main` is open, CI green (6/6), mergeable, head `b22814f`. The PR itself and `git log origin/main..HEAD` hold the full feature history, so it isn't repeated here.
 - Decision already made by the user: **freeze the repo as a prototype**. README now has a "Status: frozen prototype" section with known limitations (README.md, top).
